@@ -152,20 +152,33 @@ export async function getState(): Promise<State> {
   };
 }
 
-// เขียน choices ใหม่ทั้งหมดของคนหนึ่ง (ล้างเดิม + insert ใหม่) ทีละ statement
-// ห้ามใช้ array-transaction/IN (${array}) — neon HTTP ขยาย array ไม่น่าเชื่อถือ
+// multi-row INSERT ใน statement เดียว (ลด HTTP round-trips ไป Neon)
+async function bulkInsert(
+  sql: ReturnType<typeof db>,
+  table: string,
+  cols: string[],
+  rows: any[][],
+  onConflict = "",
+) {
+  if (!rows.length) return;
+  const per = cols.length;
+  const values = rows.map((_, i) => `(${Array.from({ length: per }, (_, k) => `$${i * per + k + 1}`).join(",")})`).join(",");
+  const text = `INSERT INTO ${table} (${cols.join(",")}) VALUES ${values}${onConflict}`;
+  await sql.query(text, rows.flat());
+}
+
+// เขียน choices ใหม่ทั้งหมดของคนหนึ่ง (ล้างเดิม + insert ใหม่)
 async function applyChoices(
   sql: ReturnType<typeof db>,
   code: string,
   choices: string[],
 ) {
   await sql`DELETE FROM choices WHERE participant_code = ${code}`;
+  const rows: any[][] = [];
   for (let i = 0; i < choices.length; i++) {
-    const wid = choices[i];
-    if (wid) {
-      await sql`INSERT INTO choices (participant_code, rank, ward_id) VALUES (${code}, ${i + 1}, ${wid})`;
-    }
+    if (choices[i]) rows.push([code, i + 1, choices[i]]);
   }
+  await bulkInsert(sql, "choices", ["participant_code", "rank", "ward_id"], rows);
 }
 
 export async function saveParticipant(
@@ -216,11 +229,13 @@ export async function replaceWards(wards: Ward[]) {
   const existing = (await sql`SELECT id FROM wards`) as Row[];
   const toDelete = existing.map((r) => r.id).filter((id: string) => !provided.includes(id));
 
-  for (let i = 0; i < wards.length; i++) {
-    const w = wards[i];
-    await sql`INSERT INTO wards (id, name, capacity, pos) VALUES (${w.id}, ${w.name}, ${w.capacity}, ${i})
-              ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, capacity = EXCLUDED.capacity, pos = EXCLUDED.pos`;
-  }
+  await bulkInsert(
+    sql,
+    "wards",
+    ["id", "name", "capacity", "pos"],
+    wards.map((w, i) => [w.id, w.name, w.capacity, i]),
+    " ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, capacity = EXCLUDED.capacity, pos = EXCLUDED.pos",
+  );
   // ลบวอร์ดที่ถูกลบออก ทีละอัน (cascade choices ฝั่ง DB)
   for (const id of toDelete) {
     await sql`DELETE FROM wards WHERE id = ${id}`;
@@ -269,10 +284,12 @@ export async function runAdmission(): Promise<{ assignments: Assignment[]; runAt
   const rid = run[0].id;
   const runAt = run[0].created_at as string;
 
-  for (const a of result) {
-    await sql`INSERT INTO assignments (run_id, participant_code, ward_id, rank)
-              VALUES (${rid}, ${a.code}, ${a.wardId}, ${a.rank})`;
-  }
+  await bulkInsert(
+    sql,
+    "assignments",
+    ["run_id", "participant_code", "ward_id", "rank"],
+    result.map((a) => [rid, a.code, a.wardId, a.rank]),
+  );
 
   return { assignments: result, runAt };
 }
