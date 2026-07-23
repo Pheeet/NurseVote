@@ -1,12 +1,12 @@
 -- ============================================================
---  VoteNurse / สุ่มหวอดพยาบาล — Neon schema
+--  VoteNurse / สุ่มวอร์ดพยาบาล — Neon schema
 --  Run once in Neon SQL editor (or psql / vercel env pull + push)
 -- ============================================================
 
--- หวอด (เช่น หวอด 1..6) แต่ละหวอดมีความจุ
+-- วอร์ด (เช่น วอร์ด 1..6) แต่ละวอร์ดมีความจุ
 CREATE TABLE IF NOT EXISTS wards (
   id        text PRIMARY KEY,                 -- 'w1','w2',...
-  name      text NOT NULL,                    -- 'หวอด 1'
+  name      text NOT NULL,                    -- 'วอร์ด 1'
   capacity  integer NOT NULL DEFAULT 5 CHECK (capacity >= 0),
   pos       integer NOT NULL DEFAULT 0        -- ลำดับแสดงผล
 );
@@ -22,13 +22,13 @@ CREATE TABLE IF NOT EXISTS participants (
 -- migrate: เพิ่มคอลัมน์ token สำหรับ DB เก่า
 ALTER TABLE participants ADD COLUMN IF NOT EXISTS token text NOT NULL DEFAULT '';
 
--- การจัดอันดับหวอดของแต่ละคน (admission choices)
+-- การจัดอันดับวอร์ดของแต่ละคน (admission choices)
 CREATE TABLE IF NOT EXISTS choices (
   participant_code text NOT NULL REFERENCES participants(code) ON DELETE CASCADE,
   rank             integer NOT NULL CHECK (rank >= 1),
   ward_id          text NOT NULL REFERENCES wards(id) ON DELETE CASCADE,
   PRIMARY KEY (participant_code, rank),
-  UNIQUE (participant_code, ward_id)          -- ห้ามจัดหวอดเดียวซ้ำ
+  UNIQUE (participant_code, ward_id)          -- ห้ามจัดวอร์ดเดียวซ้ำ
 );
 
 -- แต่ละรอบการสุ่ม (admin กดสุ่ม = insert รอบใหม่)
@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS runs (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
--- ผลการสุ่มของรอบนั้น (ward_id NULL = ไม่ได้หวอด)
+-- ผลการสุ่มของรอบนั้น (ward_id NULL = ไม่ได้วอร์ด)
 CREATE TABLE IF NOT EXISTS assignments (
   run_id           bigint NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
   participant_code text NOT NULL REFERENCES participants(code) ON DELETE CASCADE,
@@ -65,12 +65,12 @@ INSERT INTO settings (key, value) VALUES
   ('year', '2569')
 ON CONFLICT (key) DO NOTHING;
 
--- ---- seed หวอดเริ่มต้น (ถ้ายังว่าง) ----
+-- ---- seed วอร์ดเริ่มต้น (ถ้ายังว่าง) ----
 INSERT INTO wards (id, name, capacity, pos) VALUES
-  ('w1','หวอด 1',5,1),
-  ('w2','หวอด 2',5,2),
-  ('w3','หวอด 3',5,3),
-  ('w4','หวอด 4',5,4),
-  ('w5','หวอด 5',5,5),
-  ('w6','หวอด 6',5,6)
+  ('w1','วอร์ด 1',5,1),
+  ('w2','วอร์ด 2',5,2),
+  ('w3','วอร์ด 3',5,3),
+  ('w4','วอร์ด 4',5,4),
+  ('w5','วอร์ด 5',5,5),
+  ('w6','วอร์ด 6',5,6)
 ON CONFLICT (id) DO NOTHING;

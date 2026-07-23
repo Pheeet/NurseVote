@@ -267,7 +267,7 @@ function UserView({
           {[
             { k: "me", label: me ? "ข้อมูลของฉัน" : "ลงทะเบียน" },
             { k: "list", label: `รายชื่อ (${state.participants.length})` },
-            { k: "wards", label: "หวอด" },
+            { k: "wards", label: "วอร์ด" },
             { k: "results", label: "ผลการจัดสรร" },
           ].map((t) => {
             const active = tab === t.k;
@@ -370,7 +370,7 @@ function MePanel({
     if (!name.trim()) return setErr("กรุณากรอกชื่อ–นามสกุล");
     if (!validCode) return setErr("รหัสนักศึกษาต้องเป็นตัวเลข 9 หลัก");
     if (dupCode || editDupCode) return setErr("รหัสนักศึกษานี้ลงทะเบียนไว้แล้ว");
-    if (!choices.every((c) => c)) return setErr("กรุณาจัดอันดับหวอดให้ครบทุกอันดับ");
+    if (!choices.every((c) => c)) return setErr("กรุณาจัดอันดับวอร์ดให้ครบทุกอันดับ");
 
     await onSaveParticipant(code, name.trim(), choices);
     setMeCode(code);
@@ -426,7 +426,7 @@ function MePanel({
         {(dupCode || editDupCode) && <p className="mt-1 text-[11px] text-destructive">รหัสนักศึกษานี้ลงทะเบียนไว้แล้ว</p>}
 
         <div className="mt-4 space-y-2">
-          <div className="text-xs font-medium text-muted-foreground">จัดอันดับหวอดทั้งหมด {N} อันดับ</div>
+          <div className="text-xs font-medium text-muted-foreground">จัดอันดับวอร์ดทั้งหมด {N} อันดับ</div>
           {choices.map((val, i) => {
             const used = usedBefore(i);
             return (
@@ -443,7 +443,7 @@ function MePanel({
                   }}
                   className="min-w-0 flex-1 rounded-xl bg-muted px-3 py-2.5 text-sm outline-none focus:ring-2 focus:ring-primary/40"
                 >
-                  <option value="">— เลือกหวอด —</option>
+                  <option value="">— เลือกวอร์ด —</option>
                   {wards.map((w) => (
                     <option key={w.id} value={w.id} disabled={used.has(w.id) && val !== w.id}>
                       {w.name}
@@ -653,7 +653,7 @@ function WardsAdmin({
   const update = (id: string, patch: Partial<Ward>) =>
     markDirty(draft.map((w) => (w.id === id ? { ...w, ...patch } : w)));
   const add = () =>
-    markDirty([...draft, { id: uid(), name: `หวอด ${draft.length + 1}`, capacity: 5 }]);
+    markDirty([...draft, { id: uid(), name: `วอร์ด ${draft.length + 1}`, capacity: 5 }]);
   const remove = (id: string) => markDirty(draft.filter((w) => w.id !== id));
 
   const total = draft.reduce((s, w) => s + w.capacity, 0);
@@ -700,7 +700,7 @@ function WardsAdmin({
         onClick={add}
         className="w-full rounded-2xl border-2 border-dashed border-border py-3 text-sm font-medium text-muted-foreground hover:border-primary hover:text-primary"
       >
-        + เพิ่มหวอด
+        + เพิ่มวอร์ด
       </button>
       <button
         onClick={save}
@@ -750,13 +750,13 @@ function ResultsPanel({ state, onRun, busy }: { state: State; onRun?: () => Prom
           disabled={participants.length === 0 || busy}
           className="w-full rounded-2xl bg-primary py-4 text-base font-bold text-primary-foreground shadow-lg transition active:scale-[0.98] disabled:opacity-40"
         >
-          {busy ? "กำลังประมวลผล…" : "จัดสรรหวอด"}
+          {busy ? "กำลังประมวลผล…" : "จัดสรรวอร์ด"}
         </button>
       )}
 
       {!assignments && (
         <div className="rounded-2xl bg-card p-6 text-center text-sm text-muted-foreground shadow-[var(--shadow-soft)]">
-          {onRun ? "กดปุ่มเพื่อจัดสรรหวอดตามอันดับ" : "ยังไม่มีการประกาศผลการจัดสรร"}
+          {onRun ? "กดปุ่มเพื่อจัดสรรวอร์ดตามอันดับ" : "ยังไม่มีการประกาศผลการจัดสรร"}
         </div>
       )}
 
@@ -962,7 +962,7 @@ function AdminLogin({
   );
 }
 
-// การ์ดตั้งค่าภาค/ปีการศึกษา (แสดงในแท็บหวอดของผู้ดูแล)
+// การ์ดตั้งค่าภาค/ปีการศึกษา (แสดงในแท็บวอร์ดของผู้ดูแล)
 function SettingsCard({
   settings,
   onSave,
@@ -1179,7 +1179,7 @@ function RunsHistory({ adminKey }: { adminKey: string }) {
                     {unplaced.length > 0 && (
                       <div className="rounded-xl bg-destructive/10 p-2">
                         <div className="mb-1 text-xs font-semibold text-destructive">
-                          ไม่ได้หวอด ({unplaced.length})
+                          ไม่ได้วอร์ด ({unplaced.length})
                         </div>
                         <div className="text-[11px] text-destructive">
                           {unplaced.map((u) => u.name).join(" • ")}
@@ -1240,7 +1240,7 @@ function AdminView({
             {[
               { k: "results", label: "จัดสรร / ผล" },
               { k: "list", label: `รายชื่อ (${state.participants.length})` },
-              { k: "wards", label: `หวอด (${state.wards.length})` },
+              { k: "wards", label: `วอร์ด (${state.wards.length})` },
               { k: "history", label: "ประวัติ" },
             ].map((t) => {
               const active = tab === t.k;

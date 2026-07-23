@@ -89,12 +89,12 @@ export async function saveSettings(term: string, year: string) {
 }
 
 const DEFAULT_WARDS: Ward[] = [
-  { id: "w1", name: "หวอด 1", capacity: 5, pos: 1 },
-  { id: "w2", name: "หวอด 2", capacity: 5, pos: 2 },
-  { id: "w3", name: "หวอด 3", capacity: 5, pos: 3 },
-  { id: "w4", name: "หวอด 4", capacity: 5, pos: 4 },
-  { id: "w5", name: "หวอด 5", capacity: 5, pos: 5 },
-  { id: "w6", name: "หวอด 6", capacity: 5, pos: 6 },
+  { id: "w1", name: "วอร์ด 1", capacity: 5, pos: 1 },
+  { id: "w2", name: "วอร์ด 2", capacity: 5, pos: 2 },
+  { id: "w3", name: "วอร์ด 3", capacity: 5, pos: 3 },
+  { id: "w4", name: "วอร์ด 4", capacity: 5, pos: 4 },
+  { id: "w5", name: "วอร์ด 5", capacity: 5, pos: 5 },
+  { id: "w6", name: "วอร์ด 6", capacity: 5, pos: 6 },
 ];
 
 export function db() {
