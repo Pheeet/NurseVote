@@ -824,10 +824,14 @@ function WardsAdmin({
   const [draft, setDraft] = useState<Ward[]>(wards);
   const [saved, setSaved] = useState(true);
 
+  // sync draft เฉพาะตอน "เนื้อหา" wards เปลี่ยนจริง (ไม่ใช่ทุก refresh/poll)
+  // ถ้าผูกกับ `wards` (array ref) → polling ทุก 5s จะ reset ทับที่ admin กำลังพิมพ์
+  const wardsSig = wards.map((w) => `${w.id}|${w.name}|${w.capacity}`).join(";;");
   useEffect(() => {
     setDraft(wards);
     setSaved(true);
-  }, [wards]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wardsSig]);
 
   const markDirty = (next: Ward[]) => {
     setDraft(next);
