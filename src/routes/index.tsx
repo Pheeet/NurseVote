@@ -33,7 +33,7 @@ type State = {
 };
 
 const ME_KEY = "nurse-cheer-me";
-const ADMIN_PASSWORD = "admin2568";
+const ADMIN_PASSWORD = "Paiwardgunjaa6767";
 
 /* ============ API ============ */
 
