@@ -142,9 +142,13 @@ function Index() {
 
   const runBusy = async <T,>(fn: () => Promise<T>, okMsg?: string) => {
     setBusy(true);
+    const start = Date.now();
     try {
       const r = await fn();
       await refresh();
+      // บังคับให้ "กำลังบันทึก…" แสดงอย่างน้อย 450ms กว่าจะทัก
+      const elapsed = Date.now() - start;
+      if (elapsed < 450) await new Promise((res) => setTimeout(res, 450 - elapsed));
       if (okMsg) showToast(okMsg, "ok");
       return r;
     } catch (e: any) {
