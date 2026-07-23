@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { replaceWards, readBody, json, type Ward } from "./_lib";
+import { replaceWards, readBody, json, type Ward } from "./_lib.js";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
