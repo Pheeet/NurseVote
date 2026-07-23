@@ -430,6 +430,7 @@ function UserView({
             <MePanel
               state={state}
               me={me}
+              meCode={meCode}
               busy={busy}
               applyMe={applyMe}
               clearMe={clearMe}
@@ -457,6 +458,7 @@ function UserView({
 function MePanel({
   state,
   me,
+  meCode,
   busy,
   applyMe,
   clearMe,
@@ -465,6 +467,7 @@ function MePanel({
 }: {
   state: State;
   me: Participant | null;
+  meCode: string;
   busy: boolean;
   applyMe: (code: string, rid: string) => void;
   clearMe: () => void;
@@ -475,7 +478,8 @@ function MePanel({
   const N = wards.length;
 
   const [name, setName] = useState(me?.name ?? "");
-  const [code, setCode] = useState(me?.code ?? "");
+  // ต้องใช้รหัสเต็มจาก localStorage (me.code เป็น masked สำหรับ non-admin)
+  const [code, setCode] = useState(me ? meCode : "");
   const [choices, setChoices] = useState<string[]>(
     me?.choices?.length
       ? [...me.choices, ...Array(Math.max(0, N - me.choices.length)).fill("")].slice(0, N)
@@ -488,7 +492,7 @@ function MePanel({
   useEffect(() => {
     if (me) {
       setName(me.name);
-      setCode(me.code);
+      setCode(meCode || me.code); // meCode = รหัสเต็ม; me.code เป็น masked
       setChoices([...me.choices, ...Array(Math.max(0, N - me.choices.length)).fill("")].slice(0, N));
     } else {
       // ผู้ใช้ยังไม่ลงทะเบียน: บังคับ choices ให้ยาวเท่าจำนวนวอร์ดปัจจุบัน (คงค่าที่เลือกไว้)
