@@ -132,14 +132,25 @@ function Index() {
     }
   };
 
-  const runBusy = async <T,>(fn: () => Promise<T>) => {
+  const [toast, setToast] = useState<{ msg: string; type: "ok" | "err" } | null>(null);
+  const toastTimer = useRef<number | null>(null);
+  const showToast = (msg: string, type: "ok" | "err" = "ok") => {
+    setToast({ msg, type });
+    if (toastTimer.current) window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), 2600);
+  };
+
+  const runBusy = async <T,>(fn: () => Promise<T>, okMsg?: string) => {
     setBusy(true);
     try {
       const r = await fn();
       await refresh();
+      if (okMsg) showToast(okMsg, "ok");
       return r;
     } catch (e: any) {
-      setError(e.message || "เกิดข้อผิดพลาด");
+      const msg = e?.message || "เกิดข้อผิดพลาด";
+      setError(msg);
+      showToast(msg, "err");
     } finally {
       setBusy(false);
     }
@@ -149,17 +160,21 @@ function Index() {
     runBusy(async () => {
       const r = await API.saveParticipant(code, name, choices, { token: getToken(code) });
       if (r.token) setToken(code, r.token);
-    });
+    }, "บันทึกข้อมูลเรียบร้อยแล้ว");
   const onDeleteParticipant = (code: string) =>
-    runBusy(async () => {
-      await API.deleteParticipant(code, { token: getToken(code), adminKey });
-      if (code === meCode) clearToken(code);
-    });
-  const onSaveWards = (wards: Ward[]) => runBusy(() => API.saveWards(wards, { adminKey }));
-  const onRun = () => runBusy(() => API.run({ adminKey }));
-  const onReset = () => runBusy(() => API.reset({ adminKey }));
+    runBusy(
+      async () => {
+        await API.deleteParticipant(code, { token: getToken(code), adminKey });
+        if (code === meCode) clearToken(code);
+      },
+      "ลบข้อมูลเรียบร้อยแล้ว",
+    );
+  const onSaveWards = (wards: Ward[]) =>
+    runBusy(() => API.saveWards(wards, { adminKey }), "บันทึกวอร์ดเรียบร้อยแล้ว");
+  const onRun = () => runBusy(() => API.run({ adminKey }), "จัดสรรเสร็จเรียบร้อย");
+  const onReset = () => runBusy(() => API.reset({ adminKey }), "ล้างข้อมูลเรียบร้อยแล้ว");
   const onSaveSettings = (term: string, year: string) =>
-    runBusy(() => API.saveSettings(term, year, { adminKey }));
+    runBusy(() => API.saveSettings(term, year, { adminKey }), "บันทึกการตั้งค่าเรียบร้อยแล้ว");
 
   const me = state?.participants.find((p) => p.code === meCode) ?? null;
 
@@ -198,6 +213,7 @@ function Index() {
           state={state}
           me={me}
           meCode={meCode}
+          busy={busy}
           setMeCode={(v) => {
             setMeCode(v);
             localStorage.setItem(ME_KEY, v);
@@ -237,7 +253,38 @@ function Index() {
           onSaveSettings={onSaveSettings}
         />
       )}
+
+      <Toast toast={toast} />
     </div>
+  );
+}
+
+/* ============ TOAST ============ */
+
+function Toast({ toast }: { toast: { msg: string; type: "ok" | "err" } | null }) {
+  return (
+    <AnimatePresence>
+      {toast && (
+        <motion.div
+          initial={{ opacity: 0, y: 24, scale: 0.96 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          exit={{ opacity: 0, y: 24, scale: 0.96 }}
+          transition={{ type: "spring", stiffness: 500, damping: 32 }}
+          className="pointer-events-none fixed inset-x-0 bottom-6 z-[60] flex justify-center px-4"
+        >
+          <div
+            className={`pointer-events-auto flex items-center gap-2 rounded-2xl px-4 py-3 text-sm font-semibold shadow-lg ${
+              toast.type === "ok"
+                ? "bg-primary text-primary-foreground"
+                : "bg-destructive text-destructive-foreground"
+            }`}
+          >
+            <span>{toast.type === "ok" ? "✓" : "⚠️"}</span>
+            <span>{toast.msg}</span>
+          </div>
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 }
 
@@ -248,6 +295,7 @@ function UserView({
   me,
   meCode,
   setMeCode,
+  busy,
   onSaveParticipant,
   onDeleteParticipant,
 }: {
@@ -255,6 +303,7 @@ function UserView({
   me: Participant | null;
   meCode: string;
   setMeCode: (v: string) => void;
+  busy: boolean;
   onSaveParticipant: (code: string, name: string, choices: string[]) => Promise<unknown>;
   onDeleteParticipant: (code: string) => Promise<unknown>;
 }) {
@@ -305,6 +354,7 @@ function UserView({
             <MePanel
               state={state}
               me={me}
+              busy={busy}
               setMeCode={setMeCode}
               onSaveParticipant={onSaveParticipant}
               onDeleteParticipant={() => (me ? onDeleteParticipant(me.code) : Promise.resolve())}
@@ -329,12 +379,14 @@ function UserView({
 function MePanel({
   state,
   me,
+  busy,
   setMeCode,
   onSaveParticipant,
   onDeleteParticipant,
 }: {
   state: State;
   me: Participant | null;
+  busy: boolean;
   setMeCode: (v: string) => void;
   onSaveParticipant: (code: string, name: string, choices: string[]) => Promise<unknown>;
   onDeleteParticipant: () => Promise<unknown>;
@@ -459,18 +511,19 @@ function MePanel({
 
         <button
           onClick={submit}
-          disabled={!canSubmit}
+          disabled={!canSubmit || busy}
           className="mt-4 w-full rounded-2xl bg-primary py-3 text-sm font-semibold text-primary-foreground shadow transition disabled:opacity-40"
         >
-          {me ? "บันทึกการเปลี่ยนแปลง" : "ลงทะเบียน"}
+          {busy ? "กำลังบันทึก…" : me ? "บันทึกการเปลี่ยนแปลง" : "ลงทะเบียน"}
         </button>
 
         {me && (
           <button
             onClick={deleteMe}
-            className="mt-2 w-full rounded-2xl bg-destructive/10 py-2.5 text-xs font-semibold text-destructive"
+            disabled={busy}
+            className="mt-2 w-full rounded-2xl bg-destructive/10 py-2.5 text-xs font-semibold text-destructive disabled:opacity-40"
           >
-            ยกเลิกการลงทะเบียน
+            {busy ? "กำลังลบ…" : "ยกเลิกการลงทะเบียน"}
           </button>
         )}
       </div>
