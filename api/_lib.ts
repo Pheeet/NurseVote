@@ -80,12 +80,10 @@ async function getSettings(sql: ReturnType<typeof db>): Promise<Settings> {
 
 export async function saveSettings(term: string, year: string) {
   const sql = db();
-  await sql.transaction([
-    sql`INSERT INTO settings (key, value) VALUES ('term', ${term})
-        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-    sql`INSERT INTO settings (key, value) VALUES ('year', ${year})
-        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-  ]);
+  await sql`INSERT INTO settings (key, value) VALUES ('term', ${term})
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`;
+  await sql`INSERT INTO settings (key, value) VALUES ('year', ${year})
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`;
 }
 
 const DEFAULT_WARDS: Ward[] = [
@@ -154,23 +152,20 @@ export async function getState(): Promise<State> {
   };
 }
 
-function choiceQueries(
+// เขียน choices ใหม่ทั้งหมดของคนหนึ่ง (ล้างเดิม + insert ใหม่) ทีละ statement
+// ห้ามใช้ array-transaction/IN (${array}) — neon HTTP ขยาย array ไม่น่าเชื่อถือ
+async function applyChoices(
   sql: ReturnType<typeof db>,
   code: string,
   choices: string[],
-): ReturnType<typeof sql>[] {
-  const queries: ReturnType<typeof sql>[] = [
-    sql`DELETE FROM choices WHERE participant_code = ${code}`,
-  ];
+) {
+  await sql`DELETE FROM choices WHERE participant_code = ${code}`;
   for (let i = 0; i < choices.length; i++) {
     const wid = choices[i];
     if (wid) {
-      queries.push(
-        sql`INSERT INTO choices (participant_code, rank, ward_id) VALUES (${code}, ${i + 1}, ${wid})`,
-      );
+      await sql`INSERT INTO choices (participant_code, rank, ward_id) VALUES (${code}, ${i + 1}, ${wid})`;
     }
   }
-  return queries;
 }
 
 export async function saveParticipant(
@@ -188,19 +183,15 @@ export async function saveParticipant(
       opts.admin ||
       (!!opts.token && !!existing[0].token && safeEqual(hashToken(opts.token), existing[0].token));
     if (!allowed) throw new HttpError(403, "ไม่ใช่เจ้าของข้อมูล");
-    await sql.transaction([
-      sql`UPDATE participants SET name = ${safeName} WHERE code = ${code}`,
-      ...choiceQueries(sql, code, choices),
-    ]);
+    await sql`UPDATE participants SET name = ${safeName} WHERE code = ${code}`;
+    await applyChoices(sql, code, choices);
     return { ok: true };
   }
 
   // สมัครใหม่: สร้าง ownership token ส่งกลับให้ client เก็บ
   const token = randomBytes(24).toString("hex");
-  await sql.transaction([
-    sql`INSERT INTO participants (code, name, token) VALUES (${code}, ${safeName}, ${hashToken(token)})`,
-    ...choiceQueries(sql, code, choices),
-  ]);
+  await sql`INSERT INTO participants (code, name, token) VALUES (${code}, ${safeName}, ${hashToken(token)})`;
+  await applyChoices(sql, code, choices);
   return { ok: true, token };
 }
 
@@ -221,17 +212,19 @@ export async function removeParticipant(
 
 export async function replaceWards(wards: Ward[]) {
   const sql = db();
-  const queries: ReturnType<typeof sql>[] = [];
+  const provided = wards.map((w) => w.id);
+  const existing = (await sql`SELECT id FROM wards`) as Row[];
+  const toDelete = existing.map((r) => r.id).filter((id: string) => !provided.includes(id));
+
   for (let i = 0; i < wards.length; i++) {
     const w = wards[i];
-    queries.push(
-      sql`INSERT INTO wards (id, name, capacity, pos) VALUES (${w.id}, ${w.name}, ${w.capacity}, ${i})
-          ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, capacity = EXCLUDED.capacity, pos = EXCLUDED.pos`,
-    );
+    await sql`INSERT INTO wards (id, name, capacity, pos) VALUES (${w.id}, ${w.name}, ${w.capacity}, ${i})
+              ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, capacity = EXCLUDED.capacity, pos = EXCLUDED.pos`;
   }
-  const ids = wards.map((w) => w.id);
-  queries.push(ids.length ? sql`DELETE FROM wards WHERE id NOT IN (${ids})` : sql`DELETE FROM wards`);
-  await sql.transaction(queries);
+  // ลบวอร์ดที่ถูกลบออก ทีละอัน (cascade choices ฝั่ง DB)
+  for (const id of toDelete) {
+    await sql`DELETE FROM wards WHERE id = ${id}`;
+  }
 }
 
 export async function runAdmission(): Promise<{ assignments: Assignment[]; runAt: string }> {
@@ -276,11 +269,10 @@ export async function runAdmission(): Promise<{ assignments: Assignment[]; runAt
   const rid = run[0].id;
   const runAt = run[0].created_at as string;
 
-  const queries: ReturnType<typeof sql>[] = result.map((a) =>
-    sql`INSERT INTO assignments (run_id, participant_code, ward_id, rank)
-        VALUES (${rid}, ${a.code}, ${a.wardId}, ${a.rank})`,
-  );
-  if (queries.length) await sql.transaction(queries);
+  for (const a of result) {
+    await sql`INSERT INTO assignments (run_id, participant_code, ward_id, rank)
+              VALUES (${rid}, ${a.code}, ${a.wardId}, ${a.rank})`;
+  }
 
   return { assignments: result, runAt };
 }
@@ -348,17 +340,15 @@ export async function getRunsHistory(): Promise<RunSummary[]> {
 
 export async function resetAll() {
   const sql = db();
-  const queries: ReturnType<typeof sql>[] = [
-    sql`DELETE FROM assignments`,
-    sql`DELETE FROM runs`,
-    sql`DELETE FROM choices`,
-    sql`DELETE FROM participants`,
-    sql`DELETE FROM wards`,
-    ...DEFAULT_WARDS.map((w, i) =>
-      sql`INSERT INTO wards (id, name, capacity, pos) VALUES (${w.id}, ${w.name}, ${w.capacity}, ${i})`,
-    ),
-  ];
-  await sql.transaction(queries);
+  await sql`DELETE FROM assignments`;
+  await sql`DELETE FROM runs`;
+  await sql`DELETE FROM choices`;
+  await sql`DELETE FROM participants`;
+  await sql`DELETE FROM wards`;
+  for (let i = 0; i < DEFAULT_WARDS.length; i++) {
+    const w = DEFAULT_WARDS[i];
+    await sql`INSERT INTO wards (id, name, capacity, pos) VALUES (${w.id}, ${w.name}, ${w.capacity}, ${i})`;
+  }
 }
 
 export function json(res: VercelResponse, data: unknown, status = 200) {
