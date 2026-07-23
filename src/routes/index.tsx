@@ -33,37 +33,75 @@ type State = {
 };
 
 const ME_KEY = "nurse-cheer-me";
-const ADMIN_PASSWORD = "Paiwardgunjaa6767";
+/* ============ token storage (ownership) ============ */
+
+const TOKEN_KEY = "nurse-cheer-tokens";
+const loadTokens = (): Record<string, string> => {
+  try {
+    return JSON.parse(localStorage.getItem(TOKEN_KEY) || "{}");
+  } catch {
+    return {};
+  }
+};
+const getToken = (code: string) => loadTokens()[code];
+const setToken = (code: string, token: string) => {
+  const t = loadTokens();
+  t[code] = token;
+  localStorage.setItem(TOKEN_KEY, JSON.stringify(t));
+};
+const clearToken = (code: string) => {
+  const t = loadTokens();
+  delete t[code];
+  localStorage.setItem(TOKEN_KEY, JSON.stringify(t));
+};
 
 /* ============ API ============ */
 
 const json = (r: Response) => r.json();
+const authHeaders = (h: Record<string, string> = {}) => h;
 
 const API = {
   getState: () => fetch("/api/state").then<State>(json),
-  saveParticipant: (code: string, name: string, choices: string[]) =>
+  saveParticipant: (code: string, name: string, choices: string[], auth?: { token?: string }) =>
     fetch("/api/participant", {
       method: "PUT",
-      headers: { "content-type": "application/json" },
+      headers: authHeaders({
+        "content-type": "application/json",
+        ...(auth?.token ? { "x-participant-token": auth.token } : {}),
+      }),
       body: JSON.stringify({ code, name, choices }),
+    }).then<{ ok: true; token?: string }>(json),
+  deleteParticipant: (code: string, auth?: { token?: string; adminKey?: string }) =>
+    fetch(`/api/participant?code=${encodeURIComponent(code)}`, {
+      method: "DELETE",
+      headers: authHeaders({
+        ...(auth?.adminKey ? { "x-admin-key": auth.adminKey } : {}),
+        ...(auth?.token ? { "x-participant-token": auth.token } : {}),
+      }),
     }).then(json),
-  deleteParticipant: (code: string) =>
-    fetch(`/api/participant?code=${encodeURIComponent(code)}`, { method: "DELETE" }).then(json),
-  saveWards: (wards: Ward[]) =>
+  saveWards: (wards: Ward[], auth: { adminKey: string }) =>
     fetch("/api/wards", {
       method: "PUT",
-      headers: { "content-type": "application/json" },
+      headers: authHeaders({ "content-type": "application/json", "x-admin-key": auth.adminKey }),
       body: JSON.stringify({ wards }),
     }).then(json),
-  saveSettings: (term: string, year: string) =>
+  saveSettings: (term: string, year: string, auth: { adminKey: string }) =>
     fetch("/api/settings", {
       method: "PUT",
-      headers: { "content-type": "application/json" },
+      headers: authHeaders({ "content-type": "application/json", "x-admin-key": auth.adminKey }),
       body: JSON.stringify({ term, year }),
     }).then(json),
-  run: () => fetch("/api/run", { method: "POST" }).then<{ assignments: Assignment[]; runAt: string }>(json),
-  runs: () => fetch("/api/run").then<RunSummary[]>(json),
-  reset: () => fetch("/api/reset", { method: "POST" }).then(json),
+  run: (auth: { adminKey: string }) =>
+    fetch("/api/run", { method: "POST", headers: { "x-admin-key": auth.adminKey } }).then<{
+      assignments: Assignment[];
+      runAt: string;
+    }>(json),
+  runs: (auth?: { adminKey?: string }) =>
+    fetch("/api/run", {
+      headers: auth?.adminKey ? { "x-admin-key": auth.adminKey } : {},
+    }).then<RunSummary[]>(json),
+  reset: (auth: { adminKey: string }) =>
+    fetch("/api/reset", { method: "POST", headers: { "x-admin-key": auth.adminKey } }).then(json),
 };
 
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -74,6 +112,7 @@ function Index() {
   const [busy, setBusy] = useState(false);
   const [adminMode, setAdminMode] = useState(false);
   const [adminOk, setAdminOk] = useState(false);
+  const [adminKey, setAdminKey] = useState("");
   const [meCode, setMeCode] = useState<string>("");
   const taps = useRef(0);
   const tapTimer = useRef<number | null>(null);
@@ -107,13 +146,20 @@ function Index() {
   };
 
   const onSaveParticipant = (code: string, name: string, choices: string[]) =>
-    runBusy(() => API.saveParticipant(code, name, choices));
-  const onDeleteParticipant = (code: string) => runBusy(() => API.deleteParticipant(code));
-  const onSaveWards = (wards: Ward[]) => runBusy(() => API.saveWards(wards));
-  const onRun = () => runBusy(() => API.run());
-  const onReset = () => runBusy(() => API.reset());
+    runBusy(async () => {
+      const r = await API.saveParticipant(code, name, choices, { token: getToken(code) });
+      if (r.token) setToken(code, r.token);
+    });
+  const onDeleteParticipant = (code: string) =>
+    runBusy(async () => {
+      await API.deleteParticipant(code, { token: getToken(code), adminKey });
+      if (code === meCode) clearToken(code);
+    });
+  const onSaveWards = (wards: Ward[]) => runBusy(() => API.saveWards(wards, { adminKey }));
+  const onRun = () => runBusy(() => API.run({ adminKey }));
+  const onReset = () => runBusy(() => API.reset({ adminKey }));
   const onSaveSettings = (term: string, year: string) =>
-    runBusy(() => API.saveSettings(term, year));
+    runBusy(() => API.saveSettings(term, year, { adminKey }));
 
   const me = state?.participants.find((p) => p.code === meCode) ?? null;
 
@@ -167,7 +213,10 @@ function Index() {
 
       {adminMode && !adminOk && (
         <AdminLogin
-          onOk={() => setAdminOk(true)}
+          onOk={(key) => {
+            setAdminKey(key);
+            setAdminOk(true);
+          }}
           onClose={() => setAdminMode(false)}
         />
       )}
@@ -175,9 +224,11 @@ function Index() {
         <AdminView
           state={state}
           busy={busy}
+          adminKey={adminKey}
           onExit={() => {
             setAdminOk(false);
             setAdminMode(false);
+            setAdminKey("");
           }}
           onSaveWards={onSaveWards}
           onDeleteParticipant={onDeleteParticipant}
@@ -847,10 +898,33 @@ function ConfirmModal({
 
 /* ============ ADMIN ============ */
 
-function AdminLogin({ onOk, onClose }: { onOk: () => void; onClose: () => void }) {
+function AdminLogin({
+  onOk,
+  onClose,
+}: {
+  onOk: (key: string) => void;
+  onClose: () => void;
+}) {
   const [pw, setPw] = useState("");
   const [err, setErr] = useState("");
-  const submit = () => (pw === ADMIN_PASSWORD ? onOk() : setErr("รหัสผ่านไม่ถูกต้อง"));
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    if (!pw.trim()) return setErr("กรอกรหัสผู้ดูแล");
+    setBusy(true);
+    setErr("");
+    try {
+      const r = await fetch("/api/run", { headers: { "x-admin-key": pw.trim() } });
+      if (r.status === 401 || r.status === 403) return setErr("รหัสผู้ดูแลไม่ถูกต้อง");
+      if (!r.ok) return setErr("ตรวจสอบไม่ได้ ลองอีกครั้ง");
+      onOk(pw.trim());
+    } catch {
+      setErr("เชื่อมต่อไม่ได้");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <Modal onClose={onClose}>
       <div className="rounded-3xl bg-card p-6 shadow-[var(--shadow-soft)]">
@@ -863,7 +937,7 @@ function AdminLogin({ onOk, onClose }: { onOk: () => void; onClose: () => void }
             ยกเลิก
           </button>
         </div>
-        <p className="mb-3 text-xs text-muted-foreground">กรอกรหัสผ่านผู้ดูแลระบบ</p>
+        <p className="mb-3 text-xs text-muted-foreground">กรอกรหัสผู้ดูแลระบบ</p>
         <input
           type="password"
           value={pw}
@@ -872,15 +946,16 @@ function AdminLogin({ onOk, onClose }: { onOk: () => void; onClose: () => void }
             setPw(e.target.value);
           }}
           onKeyDown={(e) => e.key === "Enter" && submit()}
-          placeholder="รหัสผ่าน"
+          placeholder="รหัสผู้ดูแล"
           className="w-full rounded-xl bg-muted px-3 py-2.5 text-base outline-none focus:ring-2 focus:ring-primary/40"
         />
         {err && <p className="mt-2 text-xs text-destructive">{err}</p>}
         <button
           onClick={submit}
-          className="mt-3 w-full rounded-2xl bg-primary py-3 text-sm font-semibold text-primary-foreground"
+          disabled={busy}
+          className="mt-3 w-full rounded-2xl bg-primary py-3 text-sm font-semibold text-primary-foreground disabled:opacity-40"
         >
-          เข้าสู่ระบบ
+          {busy ? "กำลังตรวจสอบ…" : "เข้าสู่ระบบ"}
         </button>
       </div>
     </Modal>
@@ -971,7 +1046,7 @@ function fmtDateTH(iso: string) {
   }
 }
 
-function RunsHistory() {
+function RunsHistory({ adminKey }: { adminKey: string }) {
   const [runs, setRuns] = useState<RunSummary[] | null>(null);
   const [err, setErr] = useState("");
   const [openId, setOpenId] = useState<number | null>(null);
@@ -979,7 +1054,7 @@ function RunsHistory() {
   const load = async () => {
     try {
       setErr("");
-      setRuns(await API.runs());
+      setRuns(await API.runs({ adminKey }));
     } catch (e: any) {
       setErr(e.message || "โหลดไม่ได้");
     }
@@ -1125,6 +1200,7 @@ function RunsHistory() {
 function AdminView({
   state,
   busy,
+  adminKey,
   onExit,
   onSaveWards,
   onDeleteParticipant,
@@ -1134,6 +1210,7 @@ function AdminView({
 }: {
   state: State;
   busy: boolean;
+  adminKey: string;
   onExit: () => void;
   onSaveWards: (wards: Ward[]) => Promise<unknown>;
   onDeleteParticipant: (code: string) => Promise<unknown>;
@@ -1214,7 +1291,7 @@ function AdminView({
             {tab === "results" && (
               <ResultsPanel state={state} onRun={onRun} busy={busy} />
             )}
-            {tab === "history" && <RunsHistory />}
+            {tab === "history" && <RunsHistory adminKey={adminKey} />}
           </motion.div>
         </AnimatePresence>
 

@@ -15,8 +15,12 @@ CREATE TABLE IF NOT EXISTS wards (
 CREATE TABLE IF NOT EXISTS participants (
   code       text PRIMARY KEY,                -- '123456789'
   name       text NOT NULL,
+  token      text NOT NULL DEFAULT '',        -- hash ของ ownership token (แก้ไข/ลบตัวเอง)
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- migrate: เพิ่มคอลัมน์ token สำหรับ DB เก่า
+ALTER TABLE participants ADD COLUMN IF NOT EXISTS token text NOT NULL DEFAULT '';
 
 -- การจัดอันดับหวอดของแต่ละคน (admission choices)
 CREATE TABLE IF NOT EXISTS choices (

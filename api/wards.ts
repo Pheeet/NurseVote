@@ -1,8 +1,9 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { replaceWards, readBody, json, type Ward } from "./_lib.js";
+import { replaceWards, readBody, json, fail, isAdminReq, type Ward } from "./_lib.js";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
+    if (!isAdminReq(req)) return json(res, { error: "admin only" }, 401);
     if (req.method !== "PUT" && req.method !== "POST") {
       return json(res, { error: "method not allowed" }, 405);
     }
@@ -11,6 +12,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     await replaceWards(wards);
     return json(res, { ok: true });
   } catch (e: any) {
-    return json(res, { error: e.message }, 500);
+    return fail(res, e);
   }
 }

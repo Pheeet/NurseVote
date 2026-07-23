@@ -1,5 +1,6 @@
 import { neon } from "@neondatabase/serverless";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
+import { createHash, randomBytes } from "node:crypto";
 
 export type Ward = { id: string; name: string; capacity: number; pos?: number };
 export type Participant = { code: string; name: string; choices: string[] };
@@ -14,6 +15,52 @@ export type State = {
 };
 
 type Row = Record<string, any>;
+
+/* ============ auth helpers ============ */
+
+export class HttpError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+const NAME_MAX = 100;
+
+function hashToken(t: string) {
+  return createHash("sha256").update(t).digest("hex");
+}
+function safeEqual(a: string, b: string) {
+  const x = new TextEncoder().encode(a);
+  const y = new TextEncoder().encode(b);
+  if (x.length !== y.length) return false;
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
+}
+
+type ReqLike = { headers?: Record<string, string | string[] | undefined> };
+
+export function isAdminReq(req: ReqLike): boolean {
+  const k = process.env.ADMIN_KEY;
+  if (!k) return false;
+  const sent = req.headers?.["x-admin-key"];
+  if (!sent) return false;
+  return safeEqual(k, Array.isArray(sent) ? sent[0] : sent);
+}
+
+export function participantToken(req: ReqLike): string | undefined {
+  const h = req.headers?.["x-participant-token"];
+  if (!h) return undefined;
+  return Array.isArray(h) ? h[0] : h;
+}
+
+export function fail(res: VercelResponse, e: any) {
+  const status = e?.status || 500;
+  const msg = status >= 500 ? "server error" : e?.message || "error";
+  return json(res, { error: msg }, status);
+}
 
 const DEFAULT_SETTINGS: Settings = { term: "2", year: "2569" };
 
@@ -107,11 +154,12 @@ export async function getState(): Promise<State> {
   };
 }
 
-export async function upsertParticipant(code: string, name: string, choices: string[]) {
-  const sql = db();
+function choiceQueries(
+  sql: ReturnType<typeof db>,
+  code: string,
+  choices: string[],
+): ReturnType<typeof sql>[] {
   const queries: ReturnType<typeof sql>[] = [
-    sql`INSERT INTO participants (code, name) VALUES (${code}, ${name})
-        ON CONFLICT (code) DO UPDATE SET name = EXCLUDED.name`,
     sql`DELETE FROM choices WHERE participant_code = ${code}`,
   ];
   for (let i = 0; i < choices.length; i++) {
@@ -122,12 +170,53 @@ export async function upsertParticipant(code: string, name: string, choices: str
       );
     }
   }
-  await sql.transaction(queries);
+  return queries;
 }
 
-export async function deleteParticipant(code: string) {
+export async function saveParticipant(
+  code: string,
+  name: string,
+  choices: string[],
+  opts: { token?: string; admin: boolean },
+): Promise<{ ok: true; token?: string }> {
   const sql = db();
+  const safeName = name.slice(0, NAME_MAX);
+  const existing = (await sql`SELECT token FROM participants WHERE code = ${code}`) as Row[];
+
+  if (existing.length) {
+    const allowed =
+      opts.admin ||
+      (!!opts.token && !!existing[0].token && safeEqual(hashToken(opts.token), existing[0].token));
+    if (!allowed) throw new HttpError(403, "ไม่ใช่เจ้าของข้อมูล");
+    await sql.transaction([
+      sql`UPDATE participants SET name = ${safeName} WHERE code = ${code}`,
+      ...choiceQueries(sql, code, choices),
+    ]);
+    return { ok: true };
+  }
+
+  // สมัครใหม่: สร้าง ownership token ส่งกลับให้ client เก็บ
+  const token = randomBytes(24).toString("hex");
+  await sql.transaction([
+    sql`INSERT INTO participants (code, name, token) VALUES (${code}, ${safeName}, ${hashToken(token)})`,
+    ...choiceQueries(sql, code, choices),
+  ]);
+  return { ok: true, token };
+}
+
+export async function removeParticipant(
+  code: string,
+  opts: { token?: string; admin: boolean },
+): Promise<{ ok: true }> {
+  const sql = db();
+  const existing = (await sql`SELECT token FROM participants WHERE code = ${code}`) as Row[];
+  if (!existing.length) return { ok: true };
+  const allowed =
+    opts.admin ||
+    (!!opts.token && !!existing[0].token && safeEqual(hashToken(opts.token), existing[0].token));
+  if (!allowed) throw new HttpError(403, "ไม่ใช่เจ้าของข้อมูล");
   await sql`DELETE FROM participants WHERE code = ${code}`;
+  return { ok: true };
 }
 
 export async function replaceWards(wards: Ward[]) {

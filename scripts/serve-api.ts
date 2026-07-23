@@ -4,13 +4,15 @@ import http from "node:http";
 import { readFileSync, existsSync } from "node:fs";
 import {
   getState,
-  upsertParticipant,
-  deleteParticipant,
   replaceWards,
   runAdmission,
+  getRunsHistory,
   resetAll,
   saveSettings,
-  getRunsHistory,
+  saveParticipant,
+  removeParticipant,
+  isAdminReq,
+  participantToken,
   type Ward,
 } from "../api/_lib.ts";
 
@@ -37,6 +39,10 @@ const readBody = (req: http.IncomingMessage) =>
       }
     });
   });
+const fail = (res: http.ServerResponse, e: any) => {
+  const status = e?.status || 500;
+  send(res, { error: status >= 500 ? "server error" : e?.message || "error" }, status);
+};
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", "http://x");
@@ -46,11 +52,12 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/state" && m === "GET") return send(res, await getState());
 
     if (p === "/api/participant") {
+      const admin = isAdminReq(req);
+      const token = participantToken(req);
       if (m === "DELETE") {
         const code = url.searchParams.get("code") || "";
         if (!code) return send(res, { error: "code required" }, 400);
-        await deleteParticipant(code);
-        return send(res, { ok: true });
+        return send(res, await removeParticipant(code, { token, admin }));
       }
       if (m === "PUT" || m === "POST") {
         const b = await readBody(req);
@@ -59,17 +66,18 @@ const server = http.createServer(async (req, res) => {
         const choices: string[] = Array.isArray(b.choices) ? b.choices.map(String) : [];
         if (!/^\d{9}$/.test(code)) return send(res, { error: "code must be 9 digits" }, 400);
         if (!name) return send(res, { error: "name required" }, 400);
-        await upsertParticipant(code, name, choices);
-        return send(res, { ok: true });
+        return send(res, await saveParticipant(code, name, choices, { token, admin }));
       }
     }
 
     if (p === "/api/wards" && (m === "PUT" || m === "POST")) {
+      if (!isAdminReq(req)) return send(res, { error: "admin only" }, 401);
       const b = await readBody(req);
       await replaceWards((b.wards as Ward[]) ?? []);
       return send(res, { ok: true });
     }
     if (p === "/api/settings" && (m === "PUT" || m === "POST")) {
+      if (!isAdminReq(req)) return send(res, { error: "admin only" }, 401);
       const b = await readBody(req);
       const term = String(b.term ?? "").trim();
       const year = String(b.year ?? "").trim();
@@ -77,16 +85,20 @@ const server = http.createServer(async (req, res) => {
       await saveSettings(term, year);
       return send(res, { ok: true });
     }
-    if (p === "/api/run" && m === "GET") return send(res, await getRunsHistory());
-    if (p === "/api/run" && m === "POST") return send(res, await runAdmission());
+    if (p === "/api/run") {
+      if (!isAdminReq(req)) return send(res, { error: "admin only" }, 401);
+      if (m === "GET") return send(res, await getRunsHistory());
+      if (m === "POST") return send(res, await runAdmission());
+    }
     if (p === "/api/reset" && m === "POST") {
+      if (!isAdminReq(req)) return send(res, { error: "admin only" }, 401);
       await resetAll();
       return send(res, { ok: true });
     }
 
     return send(res, { error: "not found", path: p }, 404);
   } catch (e: any) {
-    return send(res, { error: e.message }, 500);
+    return fail(res, e);
   }
 });
 

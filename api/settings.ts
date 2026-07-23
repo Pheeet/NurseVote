@@ -1,8 +1,9 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { saveSettings, readBody, json } from "./_lib.js";
+import { saveSettings, readBody, json, fail, isAdminReq } from "./_lib.js";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
+    if (!isAdminReq(req)) return json(res, { error: "admin only" }, 401);
     if (req.method !== "PUT" && req.method !== "POST") {
       return json(res, { error: "method not allowed" }, 405);
     }
@@ -13,6 +14,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     await saveSettings(term, year);
     return json(res, { ok: true });
   } catch (e: any) {
-    return json(res, { error: e.message }, 500);
+    return fail(res, e);
   }
 }
