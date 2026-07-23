@@ -5,15 +5,18 @@ import { readFileSync, existsSync } from "node:fs";
 import {
   getState,
   replaceWards,
+  validateWards,
+  validateSettings,
   runAdmission,
   getRunsHistory,
   resetAll,
   saveSettings,
   saveParticipant,
   removeParticipant,
+  participantExists,
   isAdminReq,
   participantToken,
-  type Ward,
+  MAX_BODY_BYTES,
 } from "../api/_lib.ts";
 
 const env = new URL("../.env", import.meta.url);
@@ -23,15 +26,32 @@ if (existsSync(env))
     if (m) process.env[m[1]] = m[2].trim();
   }
 
-const send = (res: http.ServerResponse, data: unknown, status = 200) => {
-  res.writeHead(status, { "content-type": "application/json" });
+const send = (
+  res: http.ServerResponse,
+  data: unknown,
+  status = 200,
+  headers: Record<string, string> = {},
+) => {
+  res.writeHead(status, { "content-type": "application/json", ...headers });
   res.end(JSON.stringify(data));
 };
 const readBody = (req: http.IncomingMessage) =>
   new Promise<any>((resolve) => {
     let s = "";
-    req.on("data", (c) => (s += c));
+    let size = 0;
+    let aborted = false;
+    req.on("data", (c) => {
+      if (aborted) return;
+      size += c.length;
+      if (size > MAX_BODY_BYTES) {
+        // หยุดสะสม + resolve; ไม่ปิด socket เพื่อให้ handler ตอบ 400 ได้
+        aborted = true;
+        return resolve({});
+      }
+      s += c;
+    });
     req.on("end", () => {
+      if (aborted) return;
       try {
         resolve(s ? JSON.parse(s) : {});
       } catch {
@@ -49,11 +69,21 @@ const server = http.createServer(async (req, res) => {
   const p = url.pathname;
   const m = req.method;
   try {
-    if (p === "/api/state" && m === "GET") return send(res, await getState());
+    if (p === "/api/state" && m === "GET") {
+      const admin = isAdminReq(req);
+      return send(res, await getState({ admin }), 200, {
+        "cache-control": admin ? "private, no-store" : "public, s-maxage=3, stale-while-revalidate=30",
+      });
+    }
 
     if (p === "/api/participant") {
       const admin = isAdminReq(req);
       const token = participantToken(req);
+      if (m === "GET") {
+        const code = url.searchParams.get("exists") || "";
+        if (!/^\d{9}$/.test(code)) return send(res, { error: "code must be 9 digits" }, 400);
+        return send(res, await participantExists(code));
+      }
       if (m === "DELETE") {
         const code = url.searchParams.get("code") || "";
         if (!code) return send(res, { error: "code required" }, 400);
@@ -73,15 +103,13 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/wards" && (m === "PUT" || m === "POST")) {
       if (!isAdminReq(req)) return send(res, { error: "admin only" }, 401);
       const b = await readBody(req);
-      await replaceWards((b.wards as Ward[]) ?? []);
+      await replaceWards(validateWards(b.wards));
       return send(res, { ok: true });
     }
     if (p === "/api/settings" && (m === "PUT" || m === "POST")) {
       if (!isAdminReq(req)) return send(res, { error: "admin only" }, 401);
       const b = await readBody(req);
-      const term = String(b.term ?? "").trim();
-      const year = String(b.year ?? "").trim();
-      if (!term || !year) return send(res, { error: "term and year required" }, 400);
+      const { term, year } = validateSettings(b.term, b.year);
       await saveSettings(term, year);
       return send(res, { ok: true });
     }

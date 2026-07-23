@@ -2,6 +2,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 import {
   saveParticipant,
   removeParticipant,
+  participantExists,
   readBody,
   json,
   fail,
@@ -11,6 +12,12 @@ import {
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
+    if (req.method === "GET") {
+      const code = String(req.query.exists || "");
+      if (!/^\d{9}$/.test(code)) return json(res, { error: "code must be 9 digits" }, 400);
+      return json(res, await participantExists(code));
+    }
+
     if (req.method === "DELETE") {
       const code = (req.query.code as string) || "";
       if (!code) return json(res, { error: "code required" }, 400);
