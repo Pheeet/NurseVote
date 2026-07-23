@@ -7,8 +7,9 @@ export const Route = createFileRoute("/")({
 });
 
 type Ward = { id: string; name: string; capacity: number; pos?: number };
-type Participant = { code: string; name: string; choices: string[] };
-type Assignment = { code: string; wardId: string | null; rank: number | null };
+// code = public (masked สำหรับ non-admin), rid = opaque id ใช้จับคู่ตัวตน
+type Participant = { code: string; rid: string; name: string; choices: string[] };
+type Assignment = { code: string; rid?: string; wardId: string | null; rank: number | null };
 type Settings = { term: string; year: string };
 type RunItem = {
   code: string;
@@ -33,6 +34,7 @@ type State = {
 };
 
 const ME_KEY = "nurse-cheer-me";
+const ME_RID_KEY = "nurse-cheer-me-rid";
 /* ============ token storage (ownership) ============ */
 
 const TOKEN_KEY = "nurse-cheer-tokens";
@@ -61,7 +63,18 @@ const json = (r: Response) => r.json();
 const authHeaders = (h: Record<string, string> = {}) => h;
 
 const API = {
-  getState: () => fetch("/api/state").then<State>(json),
+  // public โหลด /api/state (CDN cache ได้ = กันโหลด 500 concurrent); cache:"no-store" ให้ browser ไม่เสิร์ฟ stale
+  // (browser ถามใหม่ทุกครั้ง แต่ CDN ตอบจาก cache ของมัน) → realtime ภายใน s-maxage. admin/หลังบันทึกแนบ ?t= bypass ทั้ง CDN
+  getState: (adminKey?: string, bust?: boolean) =>
+    fetch(adminKey || bust ? `/api/state?t=${Date.now()}` : "/api/state", {
+      headers: adminKey ? { "x-admin-key": adminKey } : {},
+      cache: "no-store",
+    }).then<State>(json),
+  checkExists: (code: string) =>
+    fetch(`/api/participant?exists=${encodeURIComponent(code)}`).then<{
+      exists: boolean;
+      rid: string;
+    }>(json),
   saveParticipant: (code: string, name: string, choices: string[], auth?: { token?: string }) =>
     fetch("/api/participant", {
       method: "PUT",
@@ -70,7 +83,7 @@ const API = {
         ...(auth?.token ? { "x-participant-token": auth.token } : {}),
       }),
       body: JSON.stringify({ code, name, choices }),
-    }).then<{ ok: true; token?: string }>(json),
+    }).then<{ ok: true; token?: string; rid: string }>(json),
   deleteParticipant: (code: string, auth?: { token?: string; adminKey?: string }) =>
     fetch(`/api/participant?code=${encodeURIComponent(code)}`, {
       method: "DELETE",
@@ -114,23 +127,74 @@ function Index() {
   const [adminOk, setAdminOk] = useState(false);
   const [adminKey, setAdminKey] = useState("");
   const [meCode, setMeCode] = useState<string>("");
+  const [meRid, setMeRid] = useState<string>("");
   const taps = useRef(0);
   const tapTimer = useRef<number | null>(null);
 
+  // จำตัวตน: meCode = รหัสเต็ม (เก็บ local), meRid = id opaque ใช้จับคู่กับ payload public
+  const applyMe = (code: string, rid: string) => {
+    setMeCode(code);
+    localStorage.setItem(ME_KEY, code);
+    if (rid) {
+      setMeRid(rid);
+      localStorage.setItem(ME_RID_KEY, rid);
+    }
+  };
+  const clearMe = () => {
+    setMeCode("");
+    setMeRid("");
+    localStorage.removeItem(ME_KEY);
+    localStorage.removeItem(ME_RID_KEY);
+  };
+
   useEffect(() => {
-    setMeCode(localStorage.getItem(ME_KEY) || "");
+    const savedCode = localStorage.getItem(ME_KEY) || "";
+    const savedRid = localStorage.getItem(ME_RID_KEY) || "";
+    setMeCode(savedCode);
+    setMeRid(savedRid);
+    // DB เก่า/อัปเกรด: มีรหัสแต่ยังไม่มี rid → ดึง rid จาก server ครั้งเดียว
+    if (savedCode && !savedRid) {
+      API.checkExists(savedCode)
+        .then((r) => {
+          if (r?.rid) {
+            setMeRid(r.rid);
+            localStorage.setItem(ME_RID_KEY, r.rid);
+          }
+        })
+        .catch(() => {});
+    }
     refresh();
   }, []);
 
-  const refresh = async () => {
+  const refresh = async (overrideKey?: string, bust?: boolean) => {
     try {
       setError("");
-      const s = await API.getState();
+      const key = overrideKey ?? (adminOk ? adminKey : undefined);
+      const s = await API.getState(key, bust);
       setState(s);
     } catch (e: any) {
       setError(e.message || "โหลดข้อมูลไม่สำเร็จ กรุณาลองใหม่");
     }
   };
+
+  // auto-refresh (realtime): poll ทุก 5s ผ่าน cached endpoint (CDN ช่วยรับโหลด)
+  // ข้ามตอน busy (กันชน mutation) และตอนแท็บซ่อน. pollRef อัปเดตทุก render → ได้ closure ล่าสุด
+  const pollRef = useRef<() => void>(() => {});
+  pollRef.current = () => {
+    if (!busy && typeof document !== "undefined" && !document.hidden) refresh();
+  };
+  useEffect(() => {
+    const id = window.setInterval(() => pollRef.current(), 5000);
+    // กลับมาโฟกัสแท็บ → refresh ทันที ไม่ต้องรอรอบ poll ถัดไป
+    const onVis = () => {
+      if (!document.hidden) pollRef.current();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, []);
 
   const [toast, setToast] = useState<{ msg: string; type: "ok" | "err" } | null>(null);
   const toastTimer = useRef<number | null>(null);
@@ -145,10 +209,10 @@ function Index() {
     const start = Date.now();
     try {
       const r = await fn();
-      await refresh();
-      // บังคับให้ "กำลังบันทึก…" แสดงอย่างน้อย 450ms กว่าจะทัก
+      await refresh(undefined, true); // หลัง mutation: bypass CDN cache เห็นข้อมูลตัวเองทันที
+      // บังคับให้ busy state แสดงอย่างน้อย 250ms กัน flicker (เดิม 450ms รู้สึกช้า)
       const elapsed = Date.now() - start;
-      if (elapsed < 450) await new Promise((res) => setTimeout(res, 450 - elapsed));
+      if (elapsed < 250) await new Promise((res) => setTimeout(res, 250 - elapsed));
       if (okMsg) showToast(okMsg, "ok");
       return r;
     } catch (e: any) {
@@ -164,7 +228,9 @@ function Index() {
     runBusy(async () => {
       const r = await API.saveParticipant(code, name, choices, { token: getToken(code) });
       if (r.token) setToken(code, r.token);
+      applyMe(code, r.rid);
     }, "บันทึกข้อมูลเรียบร้อยแล้ว");
+  // code ที่ส่งมาต้องเป็นรหัสเต็มเสมอ (admin ใช้ p.code จริง, ผู้ใช้ทั่วไปใช้ meCode)
   const onDeleteParticipant = (code: string) =>
     runBusy(
       async () => {
@@ -180,7 +246,7 @@ function Index() {
   const onSaveSettings = (term: string, year: string) =>
     runBusy(() => API.saveSettings(term, year, { adminKey }), "บันทึกการตั้งค่าเรียบร้อยแล้ว");
 
-  const me = state?.participants.find((p) => p.code === meCode) ?? null;
+  const me = state?.participants.find((p) => (meRid ? p.rid === meRid : false)) ?? null;
 
   const secretAdmin = () => {
     taps.current += 1;
@@ -217,11 +283,10 @@ function Index() {
           state={state}
           me={me}
           meCode={meCode}
+          meRid={meRid}
           busy={busy}
-          setMeCode={(v) => {
-            setMeCode(v);
-            localStorage.setItem(ME_KEY, v);
-          }}
+          applyMe={applyMe}
+          clearMe={clearMe}
           onSaveParticipant={onSaveParticipant}
           onDeleteParticipant={onDeleteParticipant}
         />
@@ -236,6 +301,8 @@ function Index() {
           onOk={(key) => {
             setAdminKey(key);
             setAdminOk(true);
+            // โหลด state ใหม่พร้อม key เพื่อให้เห็นรหัสเต็ม (ไม่ถูก mask)
+            refresh(key);
           }}
           onClose={() => setAdminMode(false)}
         />
@@ -249,6 +316,7 @@ function Index() {
             setAdminOk(false);
             setAdminMode(false);
             setAdminKey("");
+            refresh(""); // โหลดใหม่แบบ mask (ไม่มี key)
           }}
           onSaveWards={onSaveWards}
           onDeleteParticipant={onDeleteParticipant}
@@ -298,16 +366,20 @@ function UserView({
   state,
   me,
   meCode,
-  setMeCode,
+  meRid,
   busy,
+  applyMe,
+  clearMe,
   onSaveParticipant,
   onDeleteParticipant,
 }: {
   state: State;
   me: Participant | null;
   meCode: string;
-  setMeCode: (v: string) => void;
+  meRid: string;
   busy: boolean;
+  applyMe: (code: string, rid: string) => void;
+  clearMe: () => void;
   onSaveParticipant: (code: string, name: string, choices: string[]) => Promise<unknown>;
   onDeleteParticipant: (code: string) => Promise<unknown>;
 }) {
@@ -359,15 +431,17 @@ function UserView({
               state={state}
               me={me}
               busy={busy}
-              setMeCode={setMeCode}
+              applyMe={applyMe}
+              clearMe={clearMe}
               onSaveParticipant={onSaveParticipant}
-              onDeleteParticipant={() => (me ? onDeleteParticipant(me.code) : Promise.resolve())}
+              onDeleteParticipant={() => (meCode ? onDeleteParticipant(meCode) : Promise.resolve())}
             />
           )}
           {tab === "list" && (
             <ListPanel
               state={state}
               meCode={meCode}
+              meRid={meRid}
               isAdmin={false}
               onDeleteParticipant={onDeleteParticipant}
             />
@@ -384,14 +458,16 @@ function MePanel({
   state,
   me,
   busy,
-  setMeCode,
+  applyMe,
+  clearMe,
   onSaveParticipant,
   onDeleteParticipant,
 }: {
   state: State;
   me: Participant | null;
   busy: boolean;
-  setMeCode: (v: string) => void;
+  applyMe: (code: string, rid: string) => void;
+  clearMe: () => void;
   onSaveParticipant: (code: string, name: string, choices: string[]) => Promise<unknown>;
   onDeleteParticipant: () => Promise<unknown>;
 }) {
@@ -407,36 +483,66 @@ function MePanel({
   );
   const [err, setErr] = useState("");
 
+  // reset/resize ฟอร์มเฉพาะตอนตัวตนเปลี่ยน (login/logout) หรือจำนวนวอร์ดเปลี่ยน
+  // ไม่ผูกกับ `me` object ตรงๆ ไม่งั้น auto-refresh (polling) จะ reset ทับที่ผู้ใช้กำลังพิมพ์
   useEffect(() => {
     if (me) {
       setName(me.name);
       setCode(me.code);
       setChoices([...me.choices, ...Array(Math.max(0, N - me.choices.length)).fill("")].slice(0, N));
+    } else {
+      // ผู้ใช้ยังไม่ลงทะเบียน: บังคับ choices ให้ยาวเท่าจำนวนวอร์ดปัจจุบัน (คงค่าที่เลือกไว้)
+      // กันบั๊ก "2 วอร์ดแต่โชว์ 6 อันดับ" ตอน admin แก้จำนวนวอร์ดแล้ว state อัปเดตเอง
+      setChoices((prev) =>
+        prev.length === N ? prev : [...prev, ...Array(Math.max(0, N - prev.length)).fill("")].slice(0, N),
+      );
     }
-  }, [me, N]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [me?.rid, N]);
 
   const usedBefore = (idx: number) => new Set(choices.slice(0, idx).filter(Boolean));
   const validCode = /^\d{9}$/.test(code);
-  const dupCode = !me && state.participants.some((p) => p.code === code);
-  const editDupCode = !!me && state.participants.some((p) => p.code === code && p.code !== me.code);
-  const canSubmit = !!name.trim() && validCode && !dupCode && !editDupCode && choices.every((c) => c);
+  // ตรวจรหัสซ้ำผ่าน API (payload public ถูก mask จึง scan รายชื่อฝั่ง client ไม่ได้)
+  // รหัสถูก disable ตอนแก้ไข (me มีอยู่) จึงเช็คเฉพาะตอนสมัครใหม่
+  const [codeTaken, setCodeTaken] = useState(false);
+  useEffect(() => {
+    if (me || !validCode) {
+      setCodeTaken(false);
+      return;
+    }
+    let cancelled = false;
+    const t = window.setTimeout(() => {
+      API.checkExists(code)
+        .then((r) => {
+          if (!cancelled) setCodeTaken(!!r?.exists);
+        })
+        .catch(() => {});
+    }, 300);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(t);
+    };
+  }, [code, me, validCode]);
+
+  const dupCode = codeTaken;
+  const canSubmit = !!name.trim() && validCode && !dupCode && choices.every((c) => c);
 
   const submit = async () => {
     setErr("");
     if (!name.trim()) return setErr("กรุณากรอกชื่อ–นามสกุล");
     if (!validCode) return setErr("รหัสนักศึกษาต้องเป็นตัวเลข 9 หลัก");
-    if (dupCode || editDupCode) return setErr("รหัสนักศึกษานี้ลงทะเบียนไว้แล้ว");
+    if (dupCode) return setErr("รหัสนักศึกษานี้ลงทะเบียนไว้แล้ว");
     if (!choices.every((c) => c)) return setErr("กรุณาจัดอันดับวอร์ดให้ครบทุกอันดับ");
 
+    // identity (meCode/meRid) ถูกตั้งใน onSaveParticipant จาก rid ที่ server คืนมา
     await onSaveParticipant(code, name.trim(), choices);
-    setMeCode(code);
   };
 
   const deleteMe = async () => {
     if (!me) return;
     if (!confirm("ยกเลิกการลงทะเบียนของคุณ? ข้อมูลที่กรอกไว้จะถูกลบ")) return;
     await onDeleteParticipant();
-    setMeCode("");
+    clearMe();
     setName("");
     setCode("");
     setChoices(Array(N).fill(""));
@@ -444,9 +550,7 @@ function MePanel({
 
   return (
     <div className="space-y-4">
-      {!me && (
-        <ExistingLoginBox participants={state.participants} onLogin={(c) => setMeCode(c)} />
-      )}
+      {!me && <ExistingLoginBox onLogin={applyMe} />}
 
       <div className="rounded-3xl bg-card p-4 shadow-[var(--shadow-soft)]">
         <div className="mb-3 flex items-center justify-between">
@@ -479,7 +583,7 @@ function MePanel({
           className="mt-1 w-full rounded-xl bg-muted px-3 py-2.5 text-base tracking-widest outline-none focus:ring-2 focus:ring-primary/40 disabled:opacity-60"
         />
         {code && !validCode && <p className="mt-1 text-[11px] text-destructive">รหัสนักศึกษาต้องเป็นตัวเลข 9 หลัก</p>}
-        {(dupCode || editDupCode) && <p className="mt-1 text-[11px] text-destructive">รหัสนักศึกษานี้ลงทะเบียนไว้แล้ว</p>}
+        {dupCode && <p className="mt-1 text-[11px] text-destructive">รหัสนักศึกษานี้ลงทะเบียนไว้แล้ว</p>}
 
         <div className="mt-4 space-y-2">
           <div className="text-xs font-medium text-muted-foreground">จัดอันดับวอร์ดทั้งหมด {N} อันดับ</div>
@@ -495,6 +599,8 @@ function MePanel({
                   onChange={(e) => {
                     const next = [...choices];
                     next[i] = e.target.value;
+                    // แก้ลำดับก่อนหน้า → ล้างลำดับข้างหลัง กัน duplicate + บังคับเลือกตามลำดับ
+                    for (let k = i + 1; k < next.length; k++) next[k] = "";
                     setChoices(next);
                   }}
                   className="min-w-0 flex-1 rounded-xl bg-muted px-3 py-2.5 text-sm outline-none focus:ring-2 focus:ring-primary/40"
@@ -535,19 +641,23 @@ function MePanel({
   );
 }
 
-function ExistingLoginBox({
-  participants,
-  onLogin,
-}: {
-  participants: Participant[];
-  onLogin: (code: string) => void;
-}) {
+function ExistingLoginBox({ onLogin }: { onLogin: (code: string, rid: string) => void }) {
   const [code, setCode] = useState("");
   const [err, setErr] = useState("");
-  const login = () => {
-    const p = participants.find((x) => x.code === code);
-    if (!p) return setErr("ไม่พบรหัสนักศึกษานี้ในระบบ");
-    onLogin(code);
+  const [busy, setBusy] = useState(false);
+  const login = async () => {
+    if (!/^\d{9}$/.test(code)) return setErr("รหัสนักศึกษาต้องเป็นตัวเลข 9 หลัก");
+    setBusy(true);
+    setErr("");
+    try {
+      const r = await API.checkExists(code);
+      if (!r.exists) return setErr("ไม่พบรหัสนักศึกษานี้ในระบบ");
+      onLogin(code, r.rid);
+    } catch {
+      setErr("เชื่อมต่อไม่ได้ ลองอีกครั้ง");
+    } finally {
+      setBusy(false);
+    }
   };
   return (
     <div className="rounded-2xl bg-accent/30 p-3">
@@ -566,9 +676,10 @@ function ExistingLoginBox({
         />
         <button
           onClick={login}
-          className="rounded-xl bg-primary px-3 py-2 text-xs font-semibold text-primary-foreground"
+          disabled={busy}
+          className="rounded-xl bg-primary px-3 py-2 text-xs font-semibold text-primary-foreground disabled:opacity-40"
         >
-          ดึงข้อมูล
+          {busy ? "…" : "ดึงข้อมูล"}
         </button>
       </div>
       {err && <p className="mt-1 text-[11px] text-destructive">{err}</p>}
@@ -581,24 +692,33 @@ function ExistingLoginBox({
 function ListPanel({
   state,
   meCode,
+  meRid,
   isAdmin,
   onDeleteParticipant,
 }: {
   state: State;
   meCode: string;
+  meRid: string;
   isAdmin: boolean;
   onDeleteParticipant: (code: string) => Promise<unknown>;
 }) {
   const [q, setQ] = useState("");
+  const [deletingRid, setDeletingRid] = useState<string | null>(null);
   const filtered = state.participants.filter((p) => {
     const s = q.trim().toLowerCase();
     if (!s) return true;
     return p.name.toLowerCase().includes(s) || p.code.includes(s);
   });
 
-  const remove = async (code: string) => {
+  // ต้องส่งรหัสเต็มเข้า API: admin มี p.code จริงอยู่แล้ว, ผู้ใช้ทั่วไปลบได้แต่ตัวเอง → ใช้ meCode
+  const remove = async (p: Participant) => {
     if (!confirm("ลบรายชื่อนี้ออกจากระบบ?")) return;
-    await onDeleteParticipant(code);
+    setDeletingRid(p.rid);
+    try {
+      await onDeleteParticipant(isAdmin ? p.code : meCode);
+    } finally {
+      setDeletingRid(null);
+    }
   };
 
   return (
@@ -631,13 +751,14 @@ function ListPanel({
       ) : (
         <div className="space-y-2">
           {filtered.map((p) => {
-            const canDelete = isAdmin || p.code === meCode;
+            const isMe = !!meRid && p.rid === meRid;
+            const canDelete = isAdmin || isMe;
             return (
-              <div key={p.code} className="flex items-center gap-3 rounded-2xl bg-card p-3 shadow-[var(--shadow-soft)]">
+              <div key={p.rid} className="flex items-center gap-3 rounded-2xl bg-card p-3 shadow-[var(--shadow-soft)]">
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
                     <span className="truncate text-sm font-semibold">{p.name}</span>
-                    {p.code === meCode && (
+                    {isMe && (
                       <span className="rounded-full bg-primary/15 px-1.5 py-0.5 text-[9px] font-bold text-primary">
                         ฉัน
                       </span>
@@ -647,10 +768,11 @@ function ListPanel({
                 </div>
                 {canDelete && (
                   <button
-                    onClick={() => remove(p.code)}
-                    className="rounded-lg px-2 py-1 text-xs text-destructive hover:bg-destructive/10"
+                    onClick={() => remove(p)}
+                    disabled={deletingRid === p.rid}
+                    className="rounded-lg px-2 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-50"
                   >
-                    ลบ
+                    {deletingRid === p.rid ? "กำลังลบ…" : "ลบ"}
                   </button>
                 )}
               </div>
@@ -780,7 +902,7 @@ function ResultsPanel({ state, onRun, busy }: { state: State; onRun?: () => Prom
     const map = new Map<string, { p: Participant; rank: number }[]>();
     wards.forEach((w) => map.set(w.id, []));
     assignments.forEach((a) => {
-      const p = participants.find((x) => x.code === a.code);
+      const p = participants.find((x) => (a.rid ? x.rid === a.rid : x.code === a.code));
       if (!p) return;
       if (a.wardId) map.get(a.wardId)?.push({ p, rank: a.rank! });
     });
@@ -850,7 +972,7 @@ function ResultsPanel({ state, onRun, busy }: { state: State; onRun?: () => Prom
                     <ul className="space-y-1">
                       {members.map(({ p, rank }) => (
                         <li
-                          key={p.code}
+                          key={p.rid}
                           className="flex items-center justify-between rounded-lg bg-muted px-2 py-1.5 text-sm"
                         >
                           <span className="truncate">
@@ -1341,6 +1463,7 @@ function AdminView({
               <ListPanel
                 state={state}
                 meCode=""
+                meRid=""
                 isAdmin
                 onDeleteParticipant={onDeleteParticipant}
               />

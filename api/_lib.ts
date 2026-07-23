@@ -3,8 +3,8 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createHash, randomBytes } from "node:crypto";
 
 export type Ward = { id: string; name: string; capacity: number; pos?: number };
-export type Participant = { code: string; name: string; choices: string[] };
-export type Assignment = { code: string; wardId: string | null; rank: number | null };
+export type Participant = { code: string; rid: string; name: string; choices: string[] };
+export type Assignment = { code: string; rid?: string; wardId: string | null; rank: number | null };
 export type Settings = { term: string; year: string };
 export type State = {
   wards: Ward[];
@@ -27,6 +27,72 @@ export class HttpError extends Error {
 }
 
 const NAME_MAX = 100;
+const MAX_CHOICES = 50;
+const MAX_WARDS = 100;
+const WARD_NAME_MAX = 100;
+const WARD_ID_RE = /^[a-z0-9]{1,40}$/;
+const MAX_CAPACITY = 1000;
+const SETTING_MAX = 8;
+export const MAX_BODY_BYTES = 64 * 1024;
+
+/* ============ validation / masking helpers ============ */
+
+function bad(msg: string): never {
+  throw new HttpError(400, msg);
+}
+
+// public row id: opaque, ผูกกับ secret ทำให้ reverse จากรหัส นศ. ไม่ได้ (กัน brute-force 9 หลัก)
+const ROW_ID_SECRET = () =>
+  process.env.ROW_ID_SALT || process.env.ADMIN_KEY || "votenurse-fallback-salt";
+export function rowId(code: string): string {
+  return createHash("sha256").update(`${ROW_ID_SECRET()}:${code}`).digest("hex").slice(0, 12);
+}
+// mask รหัส นศ. เหลือ 3 หลักท้าย (เช่น ••••••789) สำหรับ payload public
+export function maskCode(code: string): string {
+  return code.length <= 3 ? code : "•".repeat(code.length - 3) + code.slice(-3);
+}
+
+// choices = ลำดับ ward id; ตัด falsy/ซ้ำ, cap ความยาว, validate รูปแบบ id
+export function validateChoices(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  if (raw.length > MAX_CHOICES) bad("too many choices");
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const c of raw) {
+    const s = String(c);
+    if (!s) continue;
+    if (!WARD_ID_RE.test(s)) bad("invalid ward id");
+    if (seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+// validate + normalize รายการวอร์ดจาก client ก่อนเขียน DB
+export function validateWards(raw: unknown): Ward[] {
+  if (!Array.isArray(raw)) bad("wards must be an array");
+  if ((raw as unknown[]).length > MAX_WARDS) bad("too many wards");
+  return (raw as any[]).map((w) => {
+    const id = String(w?.id ?? "");
+    if (!WARD_ID_RE.test(id)) bad("invalid ward id");
+    const name = String(w?.name ?? "").trim().slice(0, WARD_NAME_MAX);
+    if (!name) bad("ward name required");
+    const capacity = Number(w?.capacity);
+    if (!Number.isInteger(capacity) || capacity < 0 || capacity > MAX_CAPACITY) {
+      bad("invalid capacity");
+    }
+    return { id, name, capacity };
+  });
+}
+
+// validate term/year (คืน trimmed + cap ความยาว) — โยน 400 ถ้าว่าง
+export function validateSettings(rawTerm: unknown, rawYear: unknown): { term: string; year: string } {
+  const term = String(rawTerm ?? "").trim().slice(0, SETTING_MAX);
+  const year = String(rawYear ?? "").trim().slice(0, SETTING_MAX);
+  if (!term || !year) bad("term and year required");
+  return { term, year };
+}
 
 function hashToken(t: string) {
   return createHash("sha256").update(t).digest("hex");
@@ -64,20 +130,6 @@ export function fail(res: VercelResponse, e: any) {
 
 const DEFAULT_SETTINGS: Settings = { term: "2", year: "2569" };
 
-async function getSettings(sql: ReturnType<typeof db>): Promise<Settings> {
-  try {
-    const rows = (await sql`SELECT key, value FROM settings`) as Row[];
-    const map = new Map(rows.map((r) => [r.key, r.value]));
-    return {
-      term: map.get("term") ?? DEFAULT_SETTINGS.term,
-      year: map.get("year") ?? DEFAULT_SETTINGS.year,
-    };
-  } catch {
-    // ตาราง settings อาจยังไม่ถูก migrate — ใช้ค่าเริ่มต้นไปก่อน
-    return { ...DEFAULT_SETTINGS };
-  }
-}
-
 export async function saveSettings(term: string, year: string) {
   const sql = db();
   await sql`INSERT INTO settings (key, value) VALUES ('term', ${term})
@@ -109,15 +161,40 @@ function shuffle<T>(arr: T[]): T[] {
   return a;
 }
 
-export async function getState(): Promise<State> {
+const parseJson = <T>(v: unknown, fallback: T): T =>
+  v == null ? fallback : typeof v === "string" ? (JSON.parse(v) as T) : (v as T);
+
+export async function getState(opts: { admin: boolean } = { admin: false }): Promise<State> {
   const sql = db();
-  const [wards, participants, choices, latestRun, settings] = (await Promise.all([
-    sql`SELECT id, name, capacity, pos FROM wards ORDER BY pos, id`,
-    sql`SELECT code, name FROM participants ORDER BY created_at, code`,
-    sql`SELECT participant_code, ward_id, rank FROM choices ORDER BY participant_code, rank`,
-    sql`SELECT id, created_at FROM runs ORDER BY id DESC LIMIT 1`,
-    getSettings(sql),
-  ])) as [Row[], Row[], Row[], Row[], Settings];
+  const pubCode = (code: string) => (opts.admin ? code : maskCode(code));
+
+  // ทั้ง state ใน 1 HTTP round-trip เดียวไป Neon (เดิม 6 query) — สำคัญตอน concurrent สูง
+  const rows = (await sql`
+    SELECT
+      (SELECT coalesce(json_agg(json_build_object('id',id,'name',name,'capacity',capacity,'pos',pos) ORDER BY pos, id), '[]'::json)
+         FROM wards) AS wards,
+      (SELECT coalesce(json_agg(json_build_object('code',code,'name',name) ORDER BY created_at, code), '[]'::json)
+         FROM participants) AS participants,
+      (SELECT coalesce(json_agg(json_build_object('participant_code',participant_code,'ward_id',ward_id,'rank',rank) ORDER BY participant_code, rank), '[]'::json)
+         FROM choices) AS choices,
+      (SELECT row_to_json(r) FROM (SELECT id, created_at FROM runs ORDER BY id DESC LIMIT 1) r) AS latest_run,
+      (SELECT coalesce(json_agg(json_build_object('participant_code',participant_code,'ward_id',ward_id,'rank',rank)), '[]'::json)
+         FROM assignments WHERE run_id = (SELECT max(id) FROM runs)) AS assignments,
+      (SELECT coalesce(json_object_agg(key, value), '{}'::json) FROM settings) AS settings
+  `) as Row[];
+  const r = rows[0] ?? {};
+
+  const wards = parseJson<any[]>(r.wards, []);
+  const participants = parseJson<any[]>(r.participants, []);
+  const choices = parseJson<any[]>(r.choices, []);
+  const latestRun = parseJson<any>(r.latest_run, null);
+  const asg = parseJson<any[]>(r.assignments, []);
+  const settingsMap = parseJson<Record<string, string>>(r.settings, {});
+
+  const settings: Settings = {
+    term: settingsMap.term ?? DEFAULT_SETTINGS.term,
+    year: settingsMap.year ?? DEFAULT_SETTINGS.year,
+  };
 
   const choiceMap = new Map<string, string[]>();
   for (const c of choices) {
@@ -127,22 +204,21 @@ export async function getState(): Promise<State> {
 
   let assignments: Assignment[] | null = null;
   let runAt: string | null = null;
-  if (latestRun.length) {
-    const rows = (await sql`
-      SELECT participant_code, ward_id, rank FROM assignments WHERE run_id = ${latestRun[0].id}
-    `) as Row[];
-    assignments = rows.map((r) => ({
-      code: r.participant_code,
-      wardId: r.ward_id,
-      rank: r.rank,
+  if (latestRun) {
+    assignments = asg.map((a) => ({
+      code: pubCode(a.participant_code),
+      rid: rowId(a.participant_code),
+      wardId: a.ward_id,
+      rank: a.rank,
     }));
-    runAt = latestRun[0].created_at;
+    runAt = latestRun.created_at;
   }
 
   return {
     wards: wards.map((w) => ({ id: w.id, name: w.name, capacity: w.capacity, pos: w.pos })),
     participants: participants.map((p) => ({
-      code: p.code,
+      code: pubCode(p.code),
+      rid: rowId(p.code),
       name: p.name,
       choices: choiceMap.get(p.code) ?? [],
     })),
@@ -186,9 +262,10 @@ export async function saveParticipant(
   name: string,
   choices: string[],
   opts: { token?: string; admin: boolean },
-): Promise<{ ok: true; token?: string }> {
+): Promise<{ ok: true; token?: string; rid: string }> {
   const sql = db();
   const safeName = name.slice(0, NAME_MAX);
+  const safeChoices = validateChoices(choices);
   const existing = (await sql`SELECT token FROM participants WHERE code = ${code}`) as Row[];
 
   if (existing.length) {
@@ -197,15 +274,22 @@ export async function saveParticipant(
       (!!opts.token && !!existing[0].token && safeEqual(hashToken(opts.token), existing[0].token));
     if (!allowed) throw new HttpError(403, "ไม่ใช่เจ้าของข้อมูล");
     await sql`UPDATE participants SET name = ${safeName} WHERE code = ${code}`;
-    await applyChoices(sql, code, choices);
-    return { ok: true };
+    await applyChoices(sql, code, safeChoices);
+    return { ok: true, rid: rowId(code) };
   }
 
   // สมัครใหม่: สร้าง ownership token ส่งกลับให้ client เก็บ
   const token = randomBytes(24).toString("hex");
   await sql`INSERT INTO participants (code, name, token) VALUES (${code}, ${safeName}, ${hashToken(token)})`;
-  await applyChoices(sql, code, choices);
-  return { ok: true, token };
+  await applyChoices(sql, code, safeChoices);
+  return { ok: true, token, rid: rowId(code) };
+}
+
+// เช็คว่ารหัสนี้มีในระบบไหม (ไม่คืน PII อื่น) + คืน rid ของรหัสที่ query มา
+export async function participantExists(code: string): Promise<{ exists: boolean; rid: string }> {
+  const sql = db();
+  const rows = (await sql`SELECT 1 FROM participants WHERE code = ${code}`) as Row[];
+  return { exists: rows.length > 0, rid: rowId(code) };
 }
 
 export async function removeParticipant(
@@ -240,6 +324,8 @@ export async function replaceWards(wards: Ward[]) {
   for (const id of toDelete) {
     await sql`DELETE FROM wards WHERE id = ${id}`;
   }
+  // เปลี่ยนชุดวอร์ด = อันดับเดิมของผู้ใช้ใช้ไม่ได้แล้ว → ล้าง choices ทั้งหมด ให้ทุกคนจัดอันดับใหม่
+  await sql`DELETE FROM choices`;
 }
 
 export async function runAdmission(): Promise<{ assignments: Assignment[]; runAt: string }> {
@@ -376,8 +462,21 @@ export function readBody(req: VercelRequest): Promise<any> {
   if (req.body && typeof req.body === "object") return Promise.resolve(req.body);
   return new Promise((resolve) => {
     let s = "";
-    req.on("data", (c) => (s += c));
+    let size = 0;
+    let aborted = false;
+    req.on("data", (c) => {
+      if (aborted) return;
+      size += c.length;
+      if (size > MAX_BODY_BYTES) {
+        // payload ใหญ่เกิน — หยุดสะสม + resolve เป็น {} (handler จะตอบ 400 เพราะ field ขาด)
+        // ไม่ปิด socket เอง เพื่อให้ response 400 ส่งถึง client ได้
+        aborted = true;
+        return resolve({});
+      }
+      s += c;
+    });
     req.on("end", () => {
+      if (aborted) return;
       try {
         resolve(s ? JSON.parse(s) : {});
       } catch {

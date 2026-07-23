@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { saveSettings, readBody, json, fail, isAdminReq } from "./_lib.js";
+import { saveSettings, validateSettings, readBody, json, fail, isAdminReq } from "./_lib.js";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
@@ -8,9 +8,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return json(res, { error: "method not allowed" }, 405);
     }
     const body = await readBody(req);
-    const term = String(body.term ?? "").trim();
-    const year = String(body.year ?? "").trim();
-    if (!term || !year) return json(res, { error: "term and year required" }, 400);
+    const { term, year } = validateSettings(body.term, body.year);
     await saveSettings(term, year);
     return json(res, { ok: true });
   } catch (e: any) {
