@@ -10,6 +10,20 @@ type Ward = { id: string; name: string; capacity: number; pos?: number };
 type Participant = { code: string; name: string; choices: string[] };
 type Assignment = { code: string; wardId: string | null; rank: number | null };
 type Settings = { term: string; year: string };
+type RunItem = {
+  code: string;
+  name: string;
+  wardId: string | null;
+  wardName: string;
+  rank: number | null;
+};
+type RunSummary = {
+  id: number;
+  runAt: string;
+  total: number;
+  stats: { r1: number; r2: number; rother: number; rnone: number };
+  items: RunItem[];
+};
 type State = {
   wards: Ward[];
   participants: Participant[];
@@ -48,6 +62,7 @@ const API = {
       body: JSON.stringify({ term, year }),
     }).then(json),
   run: () => fetch("/api/run", { method: "POST" }).then<{ assignments: Assignment[]; runAt: string }>(json),
+  runs: () => fetch("/api/run").then<RunSummary[]>(json),
   reset: () => fetch("/api/reset", { method: "POST" }).then(json),
 };
 
@@ -429,15 +444,12 @@ function ExistingLoginBox({
   return (
     <div className="rounded-2xl bg-accent/30 p-3">
       <div className="text-xs font-semibold text-accent-foreground">เคยลงทะเบียนไว้แล้ว?</div>
-      <p className="mt-0.5 text-[11px] text-accent-foreground/80">
-        กรอกรหัสนักศึกษาเพื่อดึงข้อมูลเดิม
-      </p>
       <div className="mt-2 flex gap-2">
         <input
           value={code}
           inputMode="numeric"
           maxLength={9}
-          placeholder="รหัสนักศึกษา 9 หลัก"
+          placeholder="กรอกรหัสนักศึกษาเพื่อดึงข้อมูลเดิม"
           onChange={(e) => {
             setErr("");
             setCode(e.target.value.replace(/\D/g, "").slice(0, 9));
@@ -485,7 +497,7 @@ function ListPanel({
     <div className="space-y-3">
       <div className="relative">
         <svg
-          className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
+          className="pointer-events-none absolute left-4 top-1/2 z-10 h-4 w-4 -translate-y-1/2 text-muted-foreground"
           viewBox="0 0 24 24"
           fill="none"
           stroke="currentColor"
@@ -946,6 +958,170 @@ function SettingsCard({
   );
 }
 
+/* ============ HISTORY ============ */
+
+function fmtDateTH(iso: string) {
+  try {
+    return new Date(iso).toLocaleString("th-TH", {
+      dateStyle: "short",
+      timeStyle: "short",
+    });
+  } catch {
+    return iso;
+  }
+}
+
+function RunsHistory() {
+  const [runs, setRuns] = useState<RunSummary[] | null>(null);
+  const [err, setErr] = useState("");
+  const [openId, setOpenId] = useState<number | null>(null);
+
+  const load = async () => {
+    try {
+      setErr("");
+      setRuns(await API.runs());
+    } catch (e: any) {
+      setErr(e.message || "โหลดไม่ได้");
+    }
+  };
+  useEffect(() => {
+    load();
+  }, []);
+
+  if (err) {
+    return (
+      <div className="rounded-2xl bg-card p-6 text-center text-sm text-destructive shadow-[var(--shadow-soft)]">
+        ⚠️ {err}
+      </div>
+    );
+  }
+  if (!runs) {
+    return (
+      <div className="rounded-2xl bg-card p-6 text-center text-sm text-muted-foreground shadow-[var(--shadow-soft)]">
+        กำลังโหลด…
+      </div>
+    );
+  }
+  if (runs.length === 0) {
+    return (
+      <div className="rounded-2xl bg-card p-6 text-center text-sm text-muted-foreground shadow-[var(--shadow-soft)]">
+        ยังไม่มีประวัติการสุ่ม
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      {runs.map((run, idx) => {
+        const open = openId === run.id;
+        const latest = idx === 0;
+        const byWard = new Map<string, RunItem[]>();
+        const unplaced: RunItem[] = [];
+        for (const it of run.items) {
+          if (!it.wardId) {
+            unplaced.push(it);
+            continue;
+          }
+          if (!byWard.has(it.wardName)) byWard.set(it.wardName, []);
+          byWard.get(it.wardName)!.push(it);
+        }
+        return (
+          <div key={run.id} className="rounded-2xl bg-card p-3 shadow-[var(--shadow-soft)]">
+            <button
+              onClick={() => setOpenId(open ? null : run.id)}
+              className="flex w-full items-center justify-between gap-2 text-left"
+            >
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-semibold">รอบที่ {run.id}</span>
+                  {latest && (
+                    <span className="rounded-full bg-primary/15 px-1.5 py-0.5 text-[9px] font-bold text-primary">
+                      ล่าสุด
+                    </span>
+                  )}
+                </div>
+                <div className="text-[11px] text-muted-foreground">{fmtDateTH(run.runAt)}</div>
+              </div>
+              <div className="flex shrink-0 items-center gap-1 text-[10px]">
+                <span className="rounded-md bg-primary/15 px-1.5 py-0.5 font-semibold text-primary">
+                  1×{run.stats.r1}
+                </span>
+                <span className="rounded-md bg-accent/40 px-1.5 py-0.5 text-accent-foreground">
+                  2×{run.stats.r2}
+                </span>
+                {run.stats.rnone > 0 && (
+                  <span className="rounded-md bg-destructive/10 px-1.5 py-0.5 text-destructive">
+                    −{run.stats.rnone}
+                  </span>
+                )}
+                <span className="ml-1 text-muted-foreground">{open ? "▲" : "▼"}</span>
+              </div>
+            </button>
+
+            <AnimatePresence initial={false}>
+              {open && (
+                <motion.div
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: "auto", opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  transition={{ duration: 0.2 }}
+                  className="overflow-hidden"
+                >
+                  <div className="mt-3 space-y-2">
+                    <div className="text-[11px] text-muted-foreground">
+                      รวม {run.total} คน • อันดับ 3+ {run.stats.rother} คน
+                    </div>
+                    {[...byWard.entries()].map(([wname, members]) => (
+                      <div key={wname} className="rounded-xl bg-muted/60 p-2">
+                        <div className="mb-1 flex items-center justify-between">
+                          <div className="text-xs font-semibold">{wname}</div>
+                          <div className="text-[10px] text-muted-foreground">{members.length} คน</div>
+                        </div>
+                        <ul className="space-y-1">
+                          {members.map((it) => (
+                            <li
+                              key={it.code}
+                              className="flex items-center justify-between rounded-lg bg-background px-2 py-1 text-sm"
+                            >
+                              <span className="truncate">
+                                {it.name}{" "}
+                                <span className="text-[10px] text-muted-foreground">({it.code})</span>
+                              </span>
+                              <span
+                                className={`ml-2 shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                                  it.rank === 1
+                                    ? "bg-primary text-primary-foreground"
+                                    : "bg-muted text-muted-foreground"
+                                }`}
+                              >
+                                อันดับ {it.rank}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ))}
+                    {unplaced.length > 0 && (
+                      <div className="rounded-xl bg-destructive/10 p-2">
+                        <div className="mb-1 text-xs font-semibold text-destructive">
+                          ไม่ได้หวอด ({unplaced.length})
+                        </div>
+                        <div className="text-[11px] text-destructive">
+                          {unplaced.map((u) => u.name).join(" • ")}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function AdminView({
   state,
   busy,
@@ -965,7 +1141,7 @@ function AdminView({
   onReset: () => Promise<unknown>;
   onSaveSettings: (term: string, year: string) => Promise<unknown>;
 }) {
-  const [tab, setTab] = useState<"wards" | "list" | "results">("results");
+  const [tab, setTab] = useState<"wards" | "list" | "results" | "history">("results");
   const [showReset, setShowReset] = useState(false);
 
   return (
@@ -983,11 +1159,12 @@ function AdminView({
           </button>
         </div>
         <LayoutGroup id="admin-tabs">
-          <nav className="mb-4 grid grid-cols-3 gap-1 rounded-2xl bg-card p-1 shadow-[var(--shadow-soft)]">
+          <nav className="mb-4 grid grid-cols-4 gap-1 rounded-2xl bg-card p-1 shadow-[var(--shadow-soft)]">
             {[
               { k: "results", label: "จัดสรร / ผล" },
               { k: "list", label: `รายชื่อ (${state.participants.length})` },
               { k: "wards", label: `หวอด (${state.wards.length})` },
+              { k: "history", label: "ประวัติ" },
             ].map((t) => {
               const active = tab === t.k;
               return (
@@ -1037,6 +1214,7 @@ function AdminView({
             {tab === "results" && (
               <ResultsPanel state={state} onRun={onRun} busy={busy} />
             )}
+            {tab === "history" && <RunsHistory />}
           </motion.div>
         </AnimatePresence>
 

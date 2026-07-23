@@ -10,6 +10,7 @@ import {
   runAdmission,
   resetAll,
   saveSettings,
+  getRunsHistory,
   type Ward,
 } from "../api/_lib.ts";
 
@@ -76,6 +77,7 @@ const server = http.createServer(async (req, res) => {
       await saveSettings(term, year);
       return send(res, { ok: true });
     }
+    if (p === "/api/run" && m === "GET") return send(res, await getRunsHistory());
     if (p === "/api/run" && m === "POST") return send(res, await runAdmission());
     if (p === "/api/reset" && m === "POST") {
       await resetAll();

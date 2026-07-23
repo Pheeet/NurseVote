@@ -196,6 +196,67 @@ export async function runAdmission(): Promise<{ assignments: Assignment[]; runAt
   return { assignments: result, runAt };
 }
 
+export type RunItem = { code: string; name: string; wardId: string | null; wardName: string; rank: number | null };
+export type RunSummary = {
+  id: number;
+  runAt: string;
+  total: number;
+  stats: { r1: number; r2: number; rother: number; rnone: number };
+  items: RunItem[];
+};
+
+export async function getRunsHistory(): Promise<RunSummary[]> {
+  const sql = db();
+  const rows = (await sql`
+    SELECT r.id AS run_id, r.created_at AS run_at,
+           a.participant_code, a.ward_id, a.rank,
+           p.name AS p_name, w.name AS w_name
+    FROM runs r
+    LEFT JOIN assignments a ON a.run_id = r.id
+    LEFT JOIN participants p ON p.code = a.participant_code
+    LEFT JOIN wards w ON w.id = a.ward_id
+    ORDER BY r.id DESC, a.rank NULLS LAST, p.name
+  `) as (Row & {
+    run_id: number;
+    run_at: string;
+    participant_code: string | null;
+    ward_id: string | null;
+    rank: number | null;
+    p_name: string | null;
+    w_name: string | null;
+  })[];
+
+  const map = new Map<number, RunSummary>();
+  for (const r of rows) {
+    if (!map.has(r.run_id)) {
+      map.set(r.run_id, {
+        id: r.run_id,
+        runAt: r.run_at,
+        total: 0,
+        stats: { r1: 0, r2: 0, rother: 0, rnone: 0 },
+        items: [],
+      });
+    }
+    if (r.participant_code) {
+      const run = map.get(r.run_id)!;
+      const item: RunItem = {
+        code: r.participant_code,
+        name: r.p_name ?? r.participant_code,
+        wardId: r.ward_id,
+        wardName: r.w_name ?? r.ward_id ?? "—",
+        rank: r.rank,
+      };
+      run.items.push(item);
+      run.total += 1;
+      if (r.rank === 1) run.stats.r1 += 1;
+      else if (r.rank === 2) run.stats.r2 += 1;
+      else if (r.rank == null) run.stats.rnone += 1;
+      else run.stats.rother += 1;
+    }
+  }
+  return [...map.values()];
+}
+
 export async function resetAll() {
   const sql = db();
   const queries: ReturnType<typeof sql>[] = [
