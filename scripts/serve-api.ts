@@ -138,8 +138,8 @@ const server = http.createServer(async (req, res) => {
         await setRegistrationOpen(b.registrationOpen);
         return send(res, { ok: true });
       }
-      const { term, year } = validateSettings(b.term, b.year);
-      await saveSettings(term, year);
+      const { term, year, title } = validateSettings(b.term, b.year, b.title);
+      await saveSettings(term, year, title);
       return send(res, { ok: true });
     }
     if (p === "/api/run") {

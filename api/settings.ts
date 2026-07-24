@@ -21,8 +21,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       await setRegistrationOpen(body.registrationOpen);
       return json(res, { ok: true });
     }
-    const { term, year } = validateSettings(body.term, body.year);
-    await saveSettings(term, year);
+    const { term, year, title } = validateSettings(body.term, body.year, body.title);
+    await saveSettings(term, year, title);
     return json(res, { ok: true });
   } catch (e: any) {
     return fail(res, e);

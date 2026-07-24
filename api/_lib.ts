@@ -14,7 +14,7 @@ export type Participant = {
   email?: string | null;
 };
 export type Assignment = { code: string; rid?: string; wardId: string | null; rank: number | null };
-export type Settings = { term: string; year: string };
+export type Settings = { term: string; year: string; title: string };
 export type RosterEntry = { code: string; name: string };
 export type State = {
   wards: Ward[];
@@ -44,6 +44,7 @@ const WARD_NAME_MAX = 100;
 const WARD_ID_RE = /^[a-z0-9]{1,40}$/;
 const MAX_CAPACITY = 1000;
 const SETTING_MAX = 8;
+const TITLE_MAX = 200;
 export const MAX_BODY_BYTES = 64 * 1024;
 
 /* ============ validation / masking helpers ============ */
@@ -97,12 +98,18 @@ export function validateWards(raw: unknown): Ward[] {
   });
 }
 
-// validate term/year (คืน trimmed + cap ความยาว) — โยน 400 ถ้าว่าง
-export function validateSettings(rawTerm: unknown, rawYear: unknown): { term: string; year: string } {
+// validate term/year/title (คืน trimmed + cap ความยาว) — โยน 400 ถ้าว่าง
+export function validateSettings(
+  rawTerm: unknown,
+  rawYear: unknown,
+  rawTitle: unknown,
+): { term: string; year: string; title: string } {
   const term = String(rawTerm ?? "").trim().slice(0, SETTING_MAX);
   const year = String(rawYear ?? "").trim().slice(0, SETTING_MAX);
+  const title = String(rawTitle ?? "").trim().slice(0, TITLE_MAX);
   if (!term || !year) bad("term and year required");
-  return { term, year };
+  if (!title) bad("title required");
+  return { term, year, title };
 }
 
 function safeEqual(a: string, b: string) {
@@ -173,13 +180,17 @@ export function fail(res: VercelResponse, e: any) {
   return json(res, { error: msg }, status);
 }
 
-const DEFAULT_SETTINGS: Settings = { term: "2", year: "2569" };
+export const DEFAULT_TITLE =
+  "ลงทะเบียนการฝึกปฏิบัติผู้นำทีมการพยาบาล และการฝึกปฏิบัติเพื่อเตรียมเข้าสู่วิชาชีพ";
+const DEFAULT_SETTINGS: Settings = { term: "2", year: "2569", title: DEFAULT_TITLE };
 
-export async function saveSettings(term: string, year: string) {
+export async function saveSettings(term: string, year: string, title: string) {
   const sql = db();
   await sql`INSERT INTO settings (key, value) VALUES ('term', ${term})
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`;
   await sql`INSERT INTO settings (key, value) VALUES ('year', ${year})
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`;
+  await sql`INSERT INTO settings (key, value) VALUES ('title', ${title})
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`;
 }
 
@@ -255,6 +266,7 @@ export async function getState(opts: { admin: boolean } = { admin: false }): Pro
   const settings: Settings = {
     term: settingsMap.term ?? DEFAULT_SETTINGS.term,
     year: settingsMap.year ?? DEFAULT_SETTINGS.year,
+    title: settingsMap.title ?? DEFAULT_SETTINGS.title,
   };
   const registrationOpen = settingsMap.registration_open !== "false";
 
