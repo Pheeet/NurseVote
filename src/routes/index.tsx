@@ -26,7 +26,9 @@ type Participant = {
   email?: string | null;
 };
 type Assignment = { code: string; rid?: string; wardId: string | null; rank: number | null };
-type Settings = { term: string; year: string };
+type Settings = { term: string; year: string; title: string };
+const DEFAULT_TITLE =
+  "ลงทะเบียนการฝึกปฏิบัติผู้นำทีมการพยาบาล และการฝึกปฏิบัติเพื่อเตรียมเข้าสู่วิชาชีพ";
 type RunItem = {
   code: string;
   name: string;
@@ -106,11 +108,11 @@ const API = {
       headers: { "content-type": "application/json", "x-admin-key": auth.adminKey },
       body: JSON.stringify({ wards }),
     }).then(json),
-  saveSettings: (term: string, year: string, auth: { adminKey: string }) =>
+  saveSettings: (term: string, year: string, title: string, auth: { adminKey: string }) =>
     fetch("/api/settings", {
       method: "PUT",
       headers: { "content-type": "application/json", "x-admin-key": auth.adminKey },
-      body: JSON.stringify({ term, year }),
+      body: JSON.stringify({ term, year, title }),
     }).then(json),
   setRegistrationOpen: (open: boolean, auth: { adminKey: string }) =>
     fetch("/api/settings", {
@@ -289,8 +291,8 @@ function Index() {
     runBusy(() => API.saveWards(wards, { adminKey }), "บันทึกวอร์ดเรียบร้อยแล้ว");
   const onRun = () => runBusy(() => API.run({ adminKey }), "จัดสรรเสร็จเรียบร้อย");
   const onReset = () => runBusy(() => API.reset({ adminKey }), "ล้างข้อมูลเรียบร้อยแล้ว");
-  const onSaveSettings = (term: string, year: string) =>
-    runBusy(() => API.saveSettings(term, year, { adminKey }), "บันทึกการตั้งค่าเรียบร้อยแล้ว");
+  const onSaveSettings = (term: string, year: string, title: string) =>
+    runBusy(() => API.saveSettings(term, year, title, { adminKey }), "บันทึกการตั้งค่าเรียบร้อยแล้ว");
   const onSetRegistrationOpen = (open: boolean) =>
     runBusy(
       () => API.setRegistrationOpen(open, { adminKey }),
@@ -318,7 +320,7 @@ function Index() {
           onClick={secretAdmin}
           className="select-none text-balance text-lg font-bold leading-snug tracking-tight"
         >
-          ลงทะเบียนการฝึกปฏิบัติผู้นำทีมการพยาบาล และการฝึกปฏิบัติเพื่อเตรียมเข้าสู่วิชาชีพ
+          {state?.settings.title ?? DEFAULT_TITLE}
         </h1>
         <p className="mt-2 text-xs text-muted-foreground">
           ประจำภาคการศึกษาที่ {state?.settings.term ?? "2"} ปีการศึกษา {state?.settings.year ?? "2569"}
@@ -1241,31 +1243,49 @@ function SettingsCard({
   busy,
 }: {
   settings: Settings;
-  onSave: (term: string, year: string) => Promise<unknown>;
+  onSave: (term: string, year: string, title: string) => Promise<unknown>;
   busy: boolean;
 }) {
+  const [title, setTitle] = useState(settings.title);
   const [term, setTerm] = useState(settings.term);
   const [year, setYear] = useState(settings.year);
   const [saved, setSaved] = useState(true);
 
   useEffect(() => {
+    setTitle(settings.title);
     setTerm(settings.term);
     setYear(settings.year);
     setSaved(true);
-  }, [settings.term, settings.year]);
+  }, [settings.title, settings.term, settings.year]);
 
-  const dirty = term.trim() !== settings.term || year.trim() !== settings.year;
-  const canSave = !!term.trim() && !!year.trim() && dirty && !busy;
+  const dirty =
+    title.trim() !== settings.title ||
+    term.trim() !== settings.term ||
+    year.trim() !== settings.year;
+  const canSave = !!title.trim() && !!term.trim() && !!year.trim() && dirty && !busy;
 
   const save = async () => {
-    await onSave(term.trim(), year.trim());
+    await onSave(term.trim(), year.trim(), title.trim());
     setSaved(true);
   };
 
   return (
     <div className="rounded-2xl bg-card p-4 shadow-[var(--shadow-soft)]">
-      <div className="text-sm font-semibold">ภาค / ปีการศึกษา</div>
+      <div className="text-sm font-semibold">หัวเรื่อง / ภาค / ปีการศึกษา</div>
       <p className="mt-1 text-xs text-muted-foreground">แสดงบนหัวเรื่องของหน้าลงทะเบียน</p>
+      <label className="mt-3 block text-xs font-medium text-muted-foreground">
+        หัวเรื่อง
+        <textarea
+          value={title}
+          rows={2}
+          onChange={(e) => {
+            setTitle(e.target.value.slice(0, 200));
+            setSaved(false);
+          }}
+          placeholder={DEFAULT_TITLE}
+          className="mt-1 w-full resize-none rounded-xl bg-muted px-3 py-2.5 text-base outline-none focus:ring-2 focus:ring-primary/40"
+        />
+      </label>
       <div className="mt-3 flex gap-2">
         <label className="flex-1 text-xs font-medium text-muted-foreground">
           ภาคการศึกษา
@@ -1618,7 +1638,7 @@ function AdminView({
   onDeleteParticipant: (code: string) => Promise<unknown>;
   onRun: () => Promise<unknown>;
   onReset: () => Promise<unknown>;
-  onSaveSettings: (term: string, year: string) => Promise<unknown>;
+  onSaveSettings: (term: string, year: string, title: string) => Promise<unknown>;
   onSetRegistrationOpen: (open: boolean) => Promise<unknown>;
   onSaveRoster: (roster: RosterEntry[]) => Promise<unknown>;
 }) {

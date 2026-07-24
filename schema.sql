@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS settings (
 INSERT INTO settings (key, value) VALUES
   ('term', '2'),
   ('year', '2569'),
+  ('title', 'ลงทะเบียนการฝึกปฏิบัติผู้นำทีมการพยาบาล และการฝึกปฏิบัติเพื่อเตรียมเข้าสู่วิชาชีพ'),
   ('registration_open', 'true')
 ON CONFLICT (key) DO NOTHING;
 
