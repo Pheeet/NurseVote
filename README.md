@@ -6,11 +6,11 @@
 
 ## ✨ ฟีเจอร์
 
-- **ผู้ใช้ (User)** — ลงทะเบียนด้วยรหัสนักศึกษา 9 หลัก + จัดอันดับวอร์ดทั้งหมด แก้ไข/ลบตัวเองได้
+- **ผู้ใช้ (User)** — login ด้วย Google → ลงทะเบียนด้วยรหัสนักศึกษา 9 หลัก + จัดอันดับวอร์ดทั้งหมด แก้ไข/ลบตัวเองได้ (ownership ผูกกับบัญชี ไม่หายเมื่อเปลี่ยนเครื่อง)
 - **รายชื่อ** — ดู/ค้นหาคนที่สมัครแล้ว
 - **วอร์ด** — ดูวอร์ดและความจุ
 - **ผลการจัดสรร** — สถิติอันดับที่ได้ + รายชื่อคนในแต่ละวอร์ด
-- **แอดมิน (ซ่อน)** — เข้าผ่านการ tap หัวเรื่อง 5 ครั้ง → login ด้วยรหัสผ่าน → จัดการวอร์ด/รายชื่อ, กดสุ่ม, ล้างข้อมูล, ตั้งค่าภาค/ปีการศึกษา
+- **แอดมิน (ซ่อน)** — เข้าผ่านการ tap หัวเรื่อง 5 ครั้ง → login ด้วยรหัสผ่าน → จัดการวอร์ด/รายชื่อ, นำเข้ารายชื่อรุ่น (roster), เปิด/ปิดรับสมัคร, กดสุ่ม, ล้างข้อมูล, ตั้งค่าภาค/ปีการศึกษา
 
 ## 🧱 Tech stack
 
@@ -25,15 +25,18 @@
 
 ```
 api/
-  _lib.ts            # db client + ทุก query + business logic
+  _lib.ts            # db client + ทุก query + business logic + verifyIdentity
   state.ts           # GET  /api/state
-  participant.ts     # GET(exists) / PUT / DELETE  /api/participant
+  me.ts              # GET  /api/me           (การลงทะเบียนของบัญชีที่ login)
+  participant.ts     # PUT / DELETE  /api/participant
+  roster.ts          # GET / PUT  /api/roster (admin import + name auto-fill)
   wards.ts           # PUT  /api/wards
   run.ts             # POST /api/run
   reset.ts           # POST /api/reset
-  settings.ts        # PUT  /api/settings
+  settings.ts        # PUT  /api/settings     (term/year + registrationOpen)
 src/
   routes/index.tsx   # ทั้งแอป (User + Admin + API client)
+  google.ts          # Google Identity Services (One Tap + ปุ่ม login)
   index.css          # theme tokens + animations
 scripts/
   serve-api.ts       # dev API server (mirror ตัวจริง, ไม่ต้อง login Vercel)
@@ -64,12 +67,16 @@ npm install
 DATABASE_URL=postgresql://USER:PASS@ep-xxx.neon.tech/dbname?sslmode=require
 ADMIN_KEY=<สุ่มยาว ≥ 32 อักขระ>
 # ROW_ID_SALT=<optional, salt สำหรับ opaque row id — default ใช้ ADMIN_KEY>
+GOOGLE_CLIENT_ID=<client id>.apps.googleusercontent.com
+VITE_GOOGLE_CLIENT_ID=<client id เดียวกัน>
 ```
 
 `ADMIN_KEY` เป็นรหัสผู้ดูแลระบบ (server ตรวจผ่าน header `x-admin-key` แบบ constant-time). สร้างค่าสุ่มด้วย:
 ```bash
 node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"
 ```
+
+`GOOGLE_CLIENT_ID` ใช้ยืนยันตัวตนผู้ลงทะเบียน (ค่าสาธารณะ ไม่มี secret). ดูวิธีสร้างที่ [Google Identity](#-google-identity--ตัวตนผู้ลงทะเบียน).
 
 ### 3. apply schema
 ```bash
@@ -97,16 +104,43 @@ npm run dev
 ## ☁️ Deploy บน Vercel
 
 1. import repo จาก GitHub (framework = Vite อัตโนมัติ)
-2. **Settings → Environment Variables** → เพิ่ม `DATABASE_URL` และ `ADMIN_KEY` (ค่าเดียวกับ `.env`)
+2. **Settings → Environment Variables** → เพิ่ม `DATABASE_URL`, `ADMIN_KEY`, `GOOGLE_CLIENT_ID`, `VITE_GOOGLE_CLIENT_ID` (ค่าเดียวกับ `.env`)
 3. deploy — `api/` functions กับ vite build ใช้ได้เลย
+
+## 🔑 Google Identity — ตัวตนผู้ลงทะเบียน
+
+ผู้ลงทะเบียนยืนยันตัวตนด้วย Google account. Ownership ผูกกับ `sub` claim ทางเดียว (ดู `docs/adr/0001`).
+แก้ปัญหา "เปลี่ยนเครื่อง/ล้างเบราว์เซอร์แล้วแก้ข้อมูลตัวเองไม่ได้" และทำให้ทุกการลงทะเบียนสาวถึงตัวได้.
+
+**สร้าง OAuth Client ID:**
+1. [Google Cloud Console](https://console.cloud.google.com/) → สร้าง project → **APIs & Services → Credentials**
+2. **Create Credentials → OAuth client ID → Web application**
+3. **Authorized JavaScript origins** — ใส่ origin ที่ใช้จริง (Google ไม่รับ wildcard):
+   - `http://localhost:5173` (dev)
+   - `https://<prod-domain>` (production)
+   - `https://<project>-git-<branch>-<team>.vercel.app` (Vercel **branch alias** สำหรับทดสอบ preview — URL คงที่ต่อ branch)
+4. copy Client ID → ใส่ทั้ง `GOOGLE_CLIENT_ID` (server verify) และ `VITE_GOOGLE_CLIENT_ID` (client แสดงปุ่ม)
+
+หน้าเว็บโหลด One Tap แบบ `auto_select` (เด้งเองถ้า login Google อยู่แล้ว) + ปุ่ม "Sign in with Google" เป็น safety net.
+Client ID เป็นค่าสาธารณะ **ไม่มี secret** — ไม่ต้องเก็บเป็นความลับ.
+
+## 👥 Roster (รายชื่อรุ่น) — กันสวมรอย
+
+Admin วางรายชื่อทั้งรุ่น (รหัส 9 หลัก + ชื่อ, paste จาก Excel) ใน **แอดมิน → วอร์ด → รายชื่อรุ่น**.
+เป็น **soft roster** (ดู `docs/adr/0002`): รหัสนอกรายชื่อ **ลงทะเบียนได้** แต่ถูกทำเครื่องหมาย "นอกรายชื่อ" ให้ admin ตรวจ
+(ไม่บล็อก เพื่อไม่ให้คนที่รายชื่อตกหล่นสมัครไม่ได้). ระบบทำงานได้แม้ roster ว่าง.
+
+**Timeline กันสวมรอย:** เปิดรับสมัคร → **ปิดรับสมัคร** (แอดมิน → จัดสรร/ผล, แช่แข็ง choices) → ตรวจรายการ "นอกรายชื่อ" → กดจัดสรร.
+ถ้าเจอสวมรอย: ลบ record นั้น (แอดมินเห็น email ผู้ก่อเหตุ) → ให้เจ้าตัวจริง login มาลงใหม่ → จัดสรรรอบใหม่.
 
 ## 🔐 Security notes
 
-- `DATABASE_URL` + `ADMIN_KEY` เป็น credential — อยู่ใน `.env` (gitignore แล้ว) **ห้าม commit**
-- ทางเข้าแอดมิน = tap หัวเรื่อง 5 ครั้ง (เป็นแค่การซ่อน UI ไม่ใช่ security) → รหัสจริงคือ **`ADMIN_KEY`** ที่ server ตรวจฝั่ง backend ทุก request. ตั้งให้สุ่มยาว ≥ 32 อักขระ. ถ้าสงสัยว่ารั่ว → เปลี่ยนค่าใน `.env` + Vercel env (การเปลี่ยน `ADMIN_KEY` จะรีเซ็ต opaque row id ด้วยถ้าไม่ได้ตั้ง `ROW_ID_SALT` แยก — ผู้ใช้จะต้อง "ดึงข้อมูลเดิม" ใหม่ครั้งเดียว)
+- `DATABASE_URL` + `ADMIN_KEY` เป็น credential — อยู่ใน `.env` (gitignore แล้ว) **ห้าม commit**. `GOOGLE_CLIENT_ID`/`VITE_GOOGLE_CLIENT_ID` เป็นค่าสาธารณะ
+- ทางเข้าแอดมิน = tap หัวเรื่อง 5 ครั้ง (เป็นแค่การซ่อน UI ไม่ใช่ security) → รหัสจริงคือ **`ADMIN_KEY`** ที่ server ตรวจฝั่ง backend ทุก request. ตั้งให้สุ่มยาว ≥ 32 อักขระ. ถ้าสงสัยว่ารั่ว → เปลี่ยนค่าใน `.env` + Vercel env
+- **ตัวตนผู้ลงทะเบียน** — Google ID token (JWT) แนบทุก request แบบ `Authorization: Bearer`, server verify กับ Google JWKS (cache in-memory) ทุกครั้ง. key = `sub` (คงที่ตลอดชีพ), เก็บ `email` ไว้ให้ admin ดูเท่านั้น. `google_sub` UNIQUE = 1 บัญชี 1 รหัส
 - ถ้า connection string รั่ว → Neon → **Reset password** แล้วเปลี่ยนทั้ง `.env` และ Vercel env
-- **PII / รหัสนักศึกษา** — `/api/state` เปิด public แต่ mask รหัสเหลือ 3 หลักท้าย (เช่น `••••••789`); รหัสเต็มเห็นได้เฉพาะ admin (แนบ `x-admin-key`) เท่านั้น
-- **Rate limiting (brute-force `ADMIN_KEY`)** — serverless in-memory limiter ไม่เสถียร จึงใช้ **Vercel WAF** แทน: Project → **Firewall → Rate Limiting** → เพิ่ม rule จำกัด req/IP (เช่น 20 req/min) บน path `/api/run`, `/api/participant`, `/api/wards`, `/api/settings`, `/api/reset`. คู่กับ `ADMIN_KEY` ที่สุ่มยาวก็เพียงพอ
+- **PII / รหัสนักศึกษา** — `/api/state` เปิด public แต่ mask รหัสเหลือ 3 หลักท้าย (เช่น `••••••789`); รหัสเต็ม + email เห็นได้เฉพาะ admin (แนบ `x-admin-key`) เท่านั้น. `/api/me` ผูกตัวตน = `no-store` เสมอ
+- **Rate limiting (brute-force `ADMIN_KEY`)** — serverless in-memory limiter ไม่เสถียร จึงใช้ **Vercel WAF** แทน: Project → **Firewall → Rate Limiting** → เพิ่ม rule จำกัด req/IP (เช่น 20 req/min) บน path `/api/run`, `/api/participant`, `/api/roster`, `/api/wards`, `/api/settings`, `/api/reset`. คู่กับ `ADMIN_KEY` ที่สุ่มยาวก็เพียงพอ
 - **Security headers** — ตั้งใน `vercel.json` (`X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy`, CSP, และ `Cache-Control: no-store` บน `/api/*`)
 - **Input limits** — API cap ขนาด payload (~64KB), จำนวน choices/wards, และ validate ชนิดข้อมูล กัน DoS/insert เกิน
 

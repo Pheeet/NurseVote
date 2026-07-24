@@ -1,8 +1,8 @@
 import { readFileSync, existsSync } from "node:fs";
 import {
   getState,
-  upsertParticipant,
-  deleteParticipant,
+  saveParticipant,
+  removeParticipant,
   runAdmission,
   resetAll,
 } from "../api/_lib.ts";
@@ -21,8 +21,8 @@ const s0 = await getState();
 console.log("wards:", s0.wards.length, "participants:", s0.participants.length);
 
 console.log("== register 2 ==");
-await upsertParticipant("111111111", "ทดสอบ ก", wards6);
-await upsertParticipant("222222222", "ทดสอบ ข", ["w2", "w1", "w3", "w4", "w5", "w6"]);
+await saveParticipant("111111111", "ทดสอบ ก", wards6, { admin: true });
+await saveParticipant("222222222", "ทดสอบ ข", ["w2", "w1", "w3", "w4", "w5", "w6"], { admin: true });
 const s1 = await getState();
 console.log("participants:", s1.participants.length);
 console.log("p1 choices:", JSON.stringify(s1.participants[0]?.choices));
@@ -37,7 +37,7 @@ const s2 = await getState();
 console.log("assignments:", s2.assignments?.length, "runAt:", s2.runAt);
 
 console.log("== delete + reset ==");
-await deleteParticipant("111111111");
+await removeParticipant("111111111", { admin: true });
 await resetAll();
 const s3 = await getState();
 console.log("after reset wards:", s3.wards.length, "participants:", s3.participants.length, "assignments:", s3.assignments);

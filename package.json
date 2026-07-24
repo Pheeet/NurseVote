@@ -17,6 +17,7 @@
     "@neondatabase/serverless": "^1.1.0",
     "@tanstack/react-router": "^1.116.0",
     "framer-motion": "^11.18.0",
+    "jose": "^5.10.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },

@@ -2,30 +2,22 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 import {
   saveParticipant,
   removeParticipant,
-  participantExists,
   readBody,
   json,
   fail,
   isAdminReq,
-  participantToken,
+  verifyIdentity,
 } from "./_lib.js";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
-    if (req.method === "GET") {
-      const code = String(req.query.exists || "");
-      if (!/^\d{9}$/.test(code)) return json(res, { error: "code must be 9 digits" }, 400);
-      return json(res, await participantExists(code));
-    }
+    const admin = isAdminReq(req);
+    const identity = await verifyIdentity(req); // null ถ้าไม่ได้ login (admin ใช้ x-admin-key แทน)
 
     if (req.method === "DELETE") {
       const code = (req.query.code as string) || "";
       if (!code) return json(res, { error: "code required" }, 400);
-      const result = await removeParticipant(code, {
-        token: participantToken(req),
-        admin: isAdminReq(req),
-      });
-      return json(res, result);
+      return json(res, await removeParticipant(code, { identity: identity ?? undefined, admin }));
     }
 
     if (req.method === "PUT" || req.method === "POST") {
@@ -34,10 +26,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const name = String(body.name || "").trim();
       const choices: string[] = Array.isArray(body.choices) ? body.choices.map(String) : [];
       if (!/^\d{9}$/.test(code)) return json(res, { error: "code must be 9 digits" }, 400);
-      if (!name) return json(res, { error: "name required" }, 400);
       const result = await saveParticipant(code, name, choices, {
-        token: participantToken(req),
-        admin: isAdminReq(req),
+        identity: identity ?? undefined,
+        admin,
       });
       return json(res, result);
     }

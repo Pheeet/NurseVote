@@ -1,6 +1,14 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { motion, AnimatePresence, LayoutGroup } from "framer-motion";
+import {
+  googleEnabled,
+  initGoogle,
+  promptOneTap,
+  renderGoogleButton,
+  loadStoredToken,
+  clearStoredToken,
+} from "../google";
 
 export const Route = createFileRoute("/")({
   component: Index,
@@ -8,7 +16,15 @@ export const Route = createFileRoute("/")({
 
 type Ward = { id: string; name: string; capacity: number; pos?: number };
 // code = public (masked สำหรับ non-admin), rid = opaque id ใช้จับคู่ตัวตน
-type Participant = { code: string; rid: string; name: string; choices: string[] };
+// offRoster/email เติมเฉพาะ payload admin
+type Participant = {
+  code: string;
+  rid: string;
+  name: string;
+  choices: string[];
+  offRoster?: boolean;
+  email?: string | null;
+};
 type Assignment = { code: string; rid?: string; wardId: string | null; rank: number | null };
 type Settings = { term: string; year: string };
 type RunItem = {
@@ -31,36 +47,20 @@ type State = {
   assignments: Assignment[] | null;
   runAt: string | null;
   settings: Settings;
+  registrationOpen: boolean;
 };
-
-const ME_KEY = "nurse-cheer-me";
-const ME_RID_KEY = "nurse-cheer-me-rid";
-/* ============ token storage (ownership) ============ */
-
-const TOKEN_KEY = "nurse-cheer-tokens";
-const loadTokens = (): Record<string, string> => {
-  try {
-    return JSON.parse(localStorage.getItem(TOKEN_KEY) || "{}");
-  } catch {
-    return {};
-  }
-};
-const getToken = (code: string) => loadTokens()[code];
-const setToken = (code: string, token: string) => {
-  const t = loadTokens();
-  t[code] = token;
-  localStorage.setItem(TOKEN_KEY, JSON.stringify(t));
-};
-const clearToken = (code: string) => {
-  const t = loadTokens();
-  delete t[code];
-  localStorage.setItem(TOKEN_KEY, JSON.stringify(t));
-};
+type MeData = { code: string; rid: string; name: string; choices: string[]; offRoster: boolean };
+type RosterEntry = { code: string; name: string };
 
 /* ============ API ============ */
 
-const json = (r: Response) => r.json();
-const authHeaders = (h: Record<string, string> = {}) => h;
+const json = async (r: Response) => {
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((data as any)?.error || `HTTP ${r.status}`);
+  return data;
+};
+const bearer = (token?: string | null): Record<string, string> =>
+  token ? { authorization: `Bearer ${token}` } : {};
 
 const API = {
   // public โหลด /api/state (CDN cache ได้ = กันโหลด 500 concurrent); cache:"no-store" ให้ browser ไม่เสิร์ฟ stale
@@ -70,40 +70,64 @@ const API = {
       headers: adminKey ? { "x-admin-key": adminKey } : {},
       cache: "no-store",
     }).then<State>(json),
-  checkExists: (code: string) =>
-    fetch(`/api/participant?exists=${encodeURIComponent(code)}`).then<{
-      exists: boolean;
-      rid: string;
+  // การลงทะเบียนของบัญชี Google ที่ login อยู่ (รหัสเต็ม, ของตัวเอง)
+  me: (token: string) =>
+    fetch("/api/me", { headers: { ...bearer(token) }, cache: "no-store" }).then<{
+      registered: boolean;
+      code?: string;
+      rid?: string;
+      name?: string;
+      choices?: string[];
+      offRoster?: boolean;
     }>(json),
-  saveParticipant: (code: string, name: string, choices: string[], auth?: { token?: string }) =>
+  // ชื่อจาก roster ตามรหัส (name auto-fill) — ต้อง login
+  rosterName: (code: string, token: string) =>
+    fetch(`/api/roster?code=${encodeURIComponent(code)}`, {
+      headers: { ...bearer(token) },
+      cache: "no-store",
+    }).then<{ found: boolean; name?: string }>(json),
+  saveParticipant: (code: string, name: string, choices: string[], token?: string | null) =>
     fetch("/api/participant", {
       method: "PUT",
-      headers: authHeaders({
-        "content-type": "application/json",
-        ...(auth?.token ? { "x-participant-token": auth.token } : {}),
-      }),
+      headers: { "content-type": "application/json", ...bearer(token) },
       body: JSON.stringify({ code, name, choices }),
-    }).then<{ ok: true; token?: string; rid: string }>(json),
-  deleteParticipant: (code: string, auth?: { token?: string; adminKey?: string }) =>
+    }).then<{ ok: true; rid: string; code: string; name: string; choices: string[]; offRoster: boolean }>(json),
+  deleteParticipant: (code: string, auth?: { token?: string | null; adminKey?: string }) =>
     fetch(`/api/participant?code=${encodeURIComponent(code)}`, {
       method: "DELETE",
-      headers: authHeaders({
+      headers: {
         ...(auth?.adminKey ? { "x-admin-key": auth.adminKey } : {}),
-        ...(auth?.token ? { "x-participant-token": auth.token } : {}),
-      }),
+        ...bearer(auth?.token),
+      },
     }).then(json),
   saveWards: (wards: Ward[], auth: { adminKey: string }) =>
     fetch("/api/wards", {
       method: "PUT",
-      headers: authHeaders({ "content-type": "application/json", "x-admin-key": auth.adminKey }),
+      headers: { "content-type": "application/json", "x-admin-key": auth.adminKey },
       body: JSON.stringify({ wards }),
     }).then(json),
   saveSettings: (term: string, year: string, auth: { adminKey: string }) =>
     fetch("/api/settings", {
       method: "PUT",
-      headers: authHeaders({ "content-type": "application/json", "x-admin-key": auth.adminKey }),
+      headers: { "content-type": "application/json", "x-admin-key": auth.adminKey },
       body: JSON.stringify({ term, year }),
     }).then(json),
+  setRegistrationOpen: (open: boolean, auth: { adminKey: string }) =>
+    fetch("/api/settings", {
+      method: "PUT",
+      headers: { "content-type": "application/json", "x-admin-key": auth.adminKey },
+      body: JSON.stringify({ registrationOpen: open }),
+    }).then(json),
+  getRoster: (auth: { adminKey: string }) =>
+    fetch("/api/roster", { headers: { "x-admin-key": auth.adminKey }, cache: "no-store" }).then<
+      RosterEntry[]
+    >(json),
+  saveRoster: (roster: RosterEntry[], auth: { adminKey: string }) =>
+    fetch("/api/roster", {
+      method: "PUT",
+      headers: { "content-type": "application/json", "x-admin-key": auth.adminKey },
+      body: JSON.stringify({ roster }),
+    }).then<{ ok: true; count: number }>(json),
   run: (auth: { adminKey: string }) =>
     fetch("/api/run", { method: "POST", headers: { "x-admin-key": auth.adminKey } }).then<{
       assignments: Assignment[];
@@ -126,44 +150,64 @@ function Index() {
   const [adminMode, setAdminMode] = useState(false);
   const [adminOk, setAdminOk] = useState(false);
   const [adminKey, setAdminKey] = useState("");
-  const [meCode, setMeCode] = useState<string>("");
-  const [meRid, setMeRid] = useState<string>("");
+  // ตัวตนผูกกับ Google (ดู docs/adr/0001): idToken = ID token (JWT), me = การลงทะเบียนของบัญชีนี้
+  const [idToken, setIdToken] = useState<string | null>(() => loadStoredToken());
+  const [me, setMe] = useState<MeData | null>(null);
+  const loggedIn = !!idToken;
+  const meRid = me?.rid ?? "";
   const taps = useRef(0);
   const tapTimer = useRef<number | null>(null);
 
-  // จำตัวตน: meCode = รหัสเต็ม (เก็บ local), meRid = id opaque ใช้จับคู่กับ payload public
-  const applyMe = (code: string, rid: string) => {
-    setMeCode(code);
-    localStorage.setItem(ME_KEY, code);
-    if (rid) {
-      setMeRid(rid);
-      localStorage.setItem(ME_RID_KEY, rid);
+  // โหลดการลงทะเบียนของบัญชีที่ login (รหัสเต็ม, ของตัวเอง)
+  const loadMe = async (token: string) => {
+    try {
+      const r = await API.me(token);
+      if (r.registered) {
+        setMe({
+          code: r.code!,
+          rid: r.rid!,
+          name: r.name!,
+          choices: r.choices ?? [],
+          offRoster: !!r.offRoster,
+        });
+      } else {
+        setMe(null);
+      }
+    } catch {
+      // token หมดอายุ/ใช้ไม่ได้ → ตัดตัวตนทิ้ง (ให้ login ใหม่)
+      clearStoredToken();
+      setIdToken(null);
+      setMe(null);
     }
-  };
-  const clearMe = () => {
-    setMeCode("");
-    setMeRid("");
-    localStorage.removeItem(ME_KEY);
-    localStorage.removeItem(ME_RID_KEY);
   };
 
+  // Google callback → เก็บ token + โหลด me. ใช้ ref ให้ initGoogle (เรียกครั้งเดียว) ได้ closure ล่าสุดเสมอ
+  const handleToken = (token: string) => {
+    setIdToken(token);
+    loadMe(token);
+  };
+  const handleTokenRef = useRef(handleToken);
+  handleTokenRef.current = handleToken;
+
+  const logout = () => {
+    clearStoredToken();
+    setIdToken(null);
+    setMe(null);
+  };
+  const signIn = () => promptOneTap();
+
   useEffect(() => {
-    const savedCode = localStorage.getItem(ME_KEY) || "";
-    const savedRid = localStorage.getItem(ME_RID_KEY) || "";
-    setMeCode(savedCode);
-    setMeRid(savedRid);
-    // DB เก่า/อัปเกรด: มีรหัสแต่ยังไม่มี rid → ดึง rid จาก server ครั้งเดียว
-    if (savedCode && !savedRid) {
-      API.checkExists(savedCode)
-        .then((r) => {
-          if (r?.rid) {
-            setMeRid(r.rid);
-            localStorage.setItem(ME_RID_KEY, r.rid);
-          }
-        })
-        .catch(() => {});
+    // มี token เก่าที่ยังไม่หมดอายุ → ใช้เลย ระหว่างรอ One Tap re-auth
+    const stored = loadStoredToken();
+    if (stored) loadMe(stored);
+    // init GIS + One Tap (auto_select เด้งเองถ้า login Google อยู่แล้ว)
+    if (googleEnabled()) {
+      initGoogle((t) => handleTokenRef.current(t)).then((ok) => {
+        if (ok && !stored) promptOneTap();
+      });
     }
     refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const refresh = async (overrideKey?: string, bust?: boolean) => {
@@ -226,16 +270,18 @@ function Index() {
 
   const onSaveParticipant = (code: string, name: string, choices: string[]) =>
     runBusy(async () => {
-      const r = await API.saveParticipant(code, name, choices, { token: getToken(code) });
-      if (r.token) setToken(code, r.token);
-      applyMe(code, r.rid);
+      const r = await API.saveParticipant(code, name, choices, idToken);
+      setMe({ code: r.code, rid: r.rid, name: r.name, choices: r.choices, offRoster: r.offRoster });
     }, "บันทึกข้อมูลเรียบร้อยแล้ว");
-  // code ที่ส่งมาต้องเป็นรหัสเต็มเสมอ (admin ใช้ p.code จริง, ผู้ใช้ทั่วไปใช้ meCode)
+  // code ต้องเป็นรหัสเต็ม (admin ใช้ p.code จริง, ผู้ใช้ทั่วไปลบได้แต่ตัวเอง = me.code)
   const onDeleteParticipant = (code: string) =>
     runBusy(
       async () => {
-        await API.deleteParticipant(code, { token: getToken(code), adminKey });
-        if (code === meCode) clearToken(code);
+        await API.deleteParticipant(code, {
+          token: idToken,
+          adminKey: adminOk ? adminKey : undefined,
+        });
+        if (me && code === me.code) setMe(null);
       },
       "ลบข้อมูลเรียบร้อยแล้ว",
     );
@@ -245,8 +291,13 @@ function Index() {
   const onReset = () => runBusy(() => API.reset({ adminKey }), "ล้างข้อมูลเรียบร้อยแล้ว");
   const onSaveSettings = (term: string, year: string) =>
     runBusy(() => API.saveSettings(term, year, { adminKey }), "บันทึกการตั้งค่าเรียบร้อยแล้ว");
-
-  const me = state?.participants.find((p) => (meRid ? p.rid === meRid : false)) ?? null;
+  const onSetRegistrationOpen = (open: boolean) =>
+    runBusy(
+      () => API.setRegistrationOpen(open, { adminKey }),
+      open ? "เปิดรับลงทะเบียนแล้ว" : "ปิดรับลงทะเบียนแล้ว",
+    );
+  const onSaveRoster = (roster: RosterEntry[]) =>
+    runBusy(() => API.saveRoster(roster, { adminKey }), "บันทึกรายชื่อรุ่นแล้ว");
 
   const secretAdmin = () => {
     taps.current += 1;
@@ -282,11 +333,12 @@ function Index() {
         <UserView
           state={state}
           me={me}
-          meCode={meCode}
           meRid={meRid}
+          loggedIn={loggedIn}
+          idToken={idToken}
           busy={busy}
-          applyMe={applyMe}
-          clearMe={clearMe}
+          onSignIn={signIn}
+          onLogout={logout}
           onSaveParticipant={onSaveParticipant}
           onDeleteParticipant={onDeleteParticipant}
         />
@@ -323,6 +375,8 @@ function Index() {
           onRun={onRun}
           onReset={onReset}
           onSaveSettings={onSaveSettings}
+          onSetRegistrationOpen={onSetRegistrationOpen}
+          onSaveRoster={onSaveRoster}
         />
       )}
 
@@ -365,25 +419,28 @@ function Toast({ toast }: { toast: { msg: string; type: "ok" | "err" } | null })
 function UserView({
   state,
   me,
-  meCode,
   meRid,
+  loggedIn,
+  idToken,
   busy,
-  applyMe,
-  clearMe,
+  onSignIn,
+  onLogout,
   onSaveParticipant,
   onDeleteParticipant,
 }: {
   state: State;
-  me: Participant | null;
-  meCode: string;
+  me: MeData | null;
   meRid: string;
+  loggedIn: boolean;
+  idToken: string | null;
   busy: boolean;
-  applyMe: (code: string, rid: string) => void;
-  clearMe: () => void;
+  onSignIn: () => void;
+  onLogout: () => void;
   onSaveParticipant: (code: string, name: string, choices: string[]) => Promise<unknown>;
   onDeleteParticipant: (code: string) => Promise<unknown>;
 }) {
   const [tab, setTab] = useState<"me" | "list" | "wards" | "results">("me");
+  const meCode = me?.code ?? "";
 
   return (
     <>
@@ -430,10 +487,11 @@ function UserView({
             <MePanel
               state={state}
               me={me}
-              meCode={meCode}
+              loggedIn={loggedIn}
+              idToken={idToken}
               busy={busy}
-              applyMe={applyMe}
-              clearMe={clearMe}
+              onSignIn={onSignIn}
+              onLogout={onLogout}
               onSaveParticipant={onSaveParticipant}
               onDeleteParticipant={() => (meCode ? onDeleteParticipant(meCode) : Promise.resolve())}
             />
@@ -458,45 +516,48 @@ function UserView({
 function MePanel({
   state,
   me,
-  meCode,
+  loggedIn,
+  idToken,
   busy,
-  applyMe,
-  clearMe,
+  onSignIn,
+  onLogout,
   onSaveParticipant,
   onDeleteParticipant,
 }: {
   state: State;
-  me: Participant | null;
-  meCode: string;
+  me: MeData | null;
+  loggedIn: boolean;
+  idToken: string | null;
   busy: boolean;
-  applyMe: (code: string, rid: string) => void;
-  clearMe: () => void;
+  onSignIn: () => void;
+  onLogout: () => void;
   onSaveParticipant: (code: string, name: string, choices: string[]) => Promise<unknown>;
   onDeleteParticipant: () => Promise<unknown>;
 }) {
   const wards = state.wards;
   const N = wards.length;
+  const closed = !state.registrationOpen;
 
   const [name, setName] = useState(me?.name ?? "");
-  // ต้องใช้รหัสเต็มจาก localStorage (me.code เป็น masked สำหรับ non-admin)
-  const [code, setCode] = useState(me ? meCode : "");
+  const [code, setCode] = useState(me?.code ?? "");
   const [choices, setChoices] = useState<string[]>(
     me?.choices?.length
       ? [...me.choices, ...Array(Math.max(0, N - me.choices.length)).fill("")].slice(0, N)
       : Array(N).fill(""),
   );
   const [err, setErr] = useState("");
+  // roster name auto-fill: 'idle'|'checking'|'found'|'none'
+  const [rosterState, setRosterState] = useState<{ status: string; name?: string }>({ status: "idle" });
 
   // reset/resize ฟอร์มเฉพาะตอนตัวตนเปลี่ยน (login/logout) หรือจำนวนวอร์ดเปลี่ยน
   // ไม่ผูกกับ `me` object ตรงๆ ไม่งั้น auto-refresh (polling) จะ reset ทับที่ผู้ใช้กำลังพิมพ์
   useEffect(() => {
     if (me) {
       setName(me.name);
-      setCode(meCode || me.code); // meCode = รหัสเต็ม; me.code เป็น masked
+      setCode(me.code);
       setChoices([...me.choices, ...Array(Math.max(0, N - me.choices.length)).fill("")].slice(0, N));
+      setRosterState({ status: me.offRoster ? "none" : "found", name: me.name });
     } else {
-      // ผู้ใช้ยังไม่ลงทะเบียน: บังคับ choices ให้ยาวเท่าจำนวนวอร์ดปัจจุบัน (คงค่าที่เลือกไว้)
-      // กันบั๊ก "2 วอร์ดแต่โชว์ 6 อันดับ" ตอน admin แก้จำนวนวอร์ดแล้ว state อัปเดตเอง
       setChoices((prev) =>
         prev.length === N ? prev : [...prev, ...Array(Math.max(0, N - prev.length)).fill("")].slice(0, N),
       );
@@ -506,39 +567,47 @@ function MePanel({
 
   const usedBefore = (idx: number) => new Set(choices.slice(0, idx).filter(Boolean));
   const validCode = /^\d{9}$/.test(code);
-  // ตรวจรหัสซ้ำผ่าน API (payload public ถูก mask จึง scan รายชื่อฝั่ง client ไม่ได้)
-  // รหัสถูก disable ตอนแก้ไข (me มีอยู่) จึงเช็คเฉพาะตอนสมัครใหม่
-  const [codeTaken, setCodeTaken] = useState(false);
+
+  // สมัครใหม่: พิมพ์รหัส → ดึงชื่อจาก roster มาเติมให้ (read-only). นอก roster → กรอกชื่อเอง
   useEffect(() => {
-    if (me || !validCode) {
-      setCodeTaken(false);
+    if (me || !validCode || !idToken) {
+      if (!me) setRosterState({ status: "idle" });
       return;
     }
     let cancelled = false;
+    setRosterState({ status: "checking" });
     const t = window.setTimeout(() => {
-      API.checkExists(code)
+      API.rosterName(code, idToken)
         .then((r) => {
-          if (!cancelled) setCodeTaken(!!r?.exists);
+          if (cancelled) return;
+          if (r.found) {
+            setRosterState({ status: "found", name: r.name });
+            setName(r.name ?? "");
+          } else {
+            setRosterState({ status: "none" });
+          }
         })
-        .catch(() => {});
+        .catch(() => {
+          if (!cancelled) setRosterState({ status: "idle" });
+        });
     }, 300);
     return () => {
       cancelled = true;
       window.clearTimeout(t);
     };
-  }, [code, me, validCode]);
+  }, [code, me, validCode, idToken]);
 
-  const dupCode = codeTaken;
-  const canSubmit = !!name.trim() && validCode && !dupCode && choices.every((c) => c);
+  // ชื่อถูกล็อกเมื่อดึงจาก roster ได้ (roster = source of truth)
+  const nameLocked = rosterState.status === "found";
+  const canSubmit =
+    !!name.trim() && validCode && !closed && choices.every((c) => c) && (me ? true : !!idToken);
 
   const submit = async () => {
     setErr("");
     if (!name.trim()) return setErr("กรุณากรอกชื่อ–นามสกุล");
     if (!validCode) return setErr("รหัสนักศึกษาต้องเป็นตัวเลข 9 หลัก");
-    if (dupCode) return setErr("รหัสนักศึกษานี้ลงทะเบียนไว้แล้ว");
     if (!choices.every((c) => c)) return setErr("กรุณาจัดอันดับวอร์ดให้ครบทุกอันดับ");
-
-    // identity (meCode/meRid) ถูกตั้งใน onSaveParticipant จาก rid ที่ server คืนมา
+    // 12(C)/ownership/ปิดรับ → server ตอบ error, แสดงผ่าน toast จาก runBusy
     await onSaveParticipant(code, name.trim(), choices);
   };
 
@@ -546,16 +615,33 @@ function MePanel({
     if (!me) return;
     if (!confirm("ยกเลิกการลงทะเบียนของคุณ? ข้อมูลที่กรอกไว้จะถูกลบ")) return;
     await onDeleteParticipant();
-    clearMe();
     setName("");
     setCode("");
     setChoices(Array(N).fill(""));
+    setRosterState({ status: "idle" });
   };
+
+  // ยังไม่ login → บังคับ login Google ก่อนเข้าฟอร์ม (ดู docs/adr/0001)
+  if (!loggedIn) {
+    return <LoginGate onSignIn={onSignIn} />;
+  }
 
   return (
     <div className="space-y-4">
-      {!me && <ExistingLoginBox onLogin={applyMe} />}
+      <div className="flex items-center justify-between rounded-2xl bg-accent/30 px-3 py-2 text-[11px]">
+        <span className="text-accent-foreground">เข้าสู่ระบบด้วย Google แล้ว</span>
+        <button onClick={onLogout} className="font-semibold text-muted-foreground underline underline-offset-2">
+          ออกจากระบบ
+        </button>
+      </div>
 
+      {closed && (
+        <div className="rounded-2xl bg-amber-500/10 px-3 py-2.5 text-xs font-medium text-amber-700 dark:text-amber-400">
+          {me ? "ปิดรับลงทะเบียนแล้ว — ดูข้อมูลได้ แต่แก้ไขไม่ได้" : "ปิดรับลงทะเบียนแล้ว"}
+        </div>
+      )}
+
+      {closed && !me ? null : (
       <div className="rounded-3xl bg-card p-4 shadow-[var(--shadow-soft)]">
         <div className="mb-3 flex items-center justify-between">
           <div className="text-sm font-semibold">{me ? "แก้ไขข้อมูลการลงทะเบียน" : "ลงทะเบียน"}</div>
@@ -566,28 +652,38 @@ function MePanel({
           )}
         </div>
 
-        <label className="text-xs font-medium text-muted-foreground">ชื่อ</label>
-        <input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="ชื่อ–นามสกุล"
-          className="mt-1 w-full rounded-xl bg-muted px-3 py-2.5 text-base outline-none focus:ring-2 focus:ring-primary/40"
-        />
-
-        <label className="mt-3 block text-xs font-medium text-muted-foreground">
+        <label className="mt-1 block text-xs font-medium text-muted-foreground">
           รหัสนักศึกษา 9 หลัก
         </label>
         <input
           value={code}
           inputMode="numeric"
           maxLength={9}
-          disabled={!!me}
+          disabled={!!me || closed}
           onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 9))}
           placeholder="เช่น 123456789"
           className="mt-1 w-full rounded-xl bg-muted px-3 py-2.5 text-base tracking-widest outline-none focus:ring-2 focus:ring-primary/40 disabled:opacity-60"
         />
         {code && !validCode && <p className="mt-1 text-[11px] text-destructive">รหัสนักศึกษาต้องเป็นตัวเลข 9 หลัก</p>}
-        {dupCode && <p className="mt-1 text-[11px] text-destructive">รหัสนักศึกษานี้ลงทะเบียนไว้แล้ว</p>}
+        {!me && rosterState.status === "none" && validCode && (
+          <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
+            ไม่พบรหัสนี้ในรายชื่อรุ่น — ลงทะเบียนได้ แต่แอดมินจะตรวจสอบภายหลัง
+          </p>
+        )}
+
+        <label className="mt-3 block text-xs font-medium text-muted-foreground">
+          ชื่อ–นามสกุล{nameLocked && " (จากรายชื่อรุ่น)"}
+        </label>
+        <input
+          value={name}
+          readOnly={nameLocked}
+          disabled={closed}
+          onChange={(e) => setName(e.target.value)}
+          placeholder={rosterState.status === "checking" ? "กำลังดึงชื่อ…" : "ชื่อ–นามสกุล"}
+          className={`mt-1 w-full rounded-xl px-3 py-2.5 text-base outline-none focus:ring-2 focus:ring-primary/40 disabled:opacity-60 ${
+            nameLocked ? "bg-muted/60 text-muted-foreground" : "bg-muted"
+          }`}
+        />
 
         <div className="mt-4 space-y-2">
           <div className="text-xs font-medium text-muted-foreground">จัดอันดับวอร์ดทั้งหมด {N} อันดับ</div>
@@ -600,6 +696,7 @@ function MePanel({
                 </div>
                 <select
                   value={val}
+                  disabled={closed}
                   onChange={(e) => {
                     const next = [...choices];
                     next[i] = e.target.value;
@@ -607,7 +704,7 @@ function MePanel({
                     for (let k = i + 1; k < next.length; k++) next[k] = "";
                     setChoices(next);
                   }}
-                  className="min-w-0 flex-1 rounded-xl bg-muted px-3 py-2.5 text-sm outline-none focus:ring-2 focus:ring-primary/40"
+                  className="min-w-0 flex-1 rounded-xl bg-muted px-3 py-2.5 text-sm outline-none focus:ring-2 focus:ring-primary/40 disabled:opacity-60"
                 >
                   <option value="">— เลือกวอร์ด —</option>
                   {wards.map((w) => (
@@ -634,59 +731,39 @@ function MePanel({
         {me && (
           <button
             onClick={deleteMe}
-            disabled={busy}
+            disabled={busy || closed}
             className="mt-2 w-full rounded-2xl bg-destructive/10 py-2.5 text-xs font-semibold text-destructive disabled:opacity-40"
           >
             {busy ? "กำลังลบ…" : "ยกเลิกการลงทะเบียน"}
           </button>
         )}
       </div>
+      )}
     </div>
   );
 }
 
-function ExistingLoginBox({ onLogin }: { onLogin: (code: string, rid: string) => void }) {
-  const [code, setCode] = useState("");
-  const [err, setErr] = useState("");
-  const [busy, setBusy] = useState(false);
-  const login = async () => {
-    if (!/^\d{9}$/.test(code)) return setErr("รหัสนักศึกษาต้องเป็นตัวเลข 9 หลัก");
-    setBusy(true);
-    setErr("");
-    try {
-      const r = await API.checkExists(code);
-      if (!r.exists) return setErr("ไม่พบรหัสนักศึกษานี้ในระบบ");
-      onLogin(code, r.rid);
-    } catch {
-      setErr("เชื่อมต่อไม่ได้ ลองอีกครั้ง");
-    } finally {
-      setBusy(false);
-    }
-  };
+// ยังไม่ login → การ์ดเชิญ login Google (One Tap เด้งเองอยู่แล้วถ้าใช้ได้; ปุ่มนี้เป็น safety net)
+function LoginGate({ onSignIn }: { onSignIn: () => void }) {
+  const btnRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (btnRef.current) renderGoogleButton(btnRef.current);
+  }, []);
   return (
-    <div className="rounded-2xl bg-accent/30 p-3">
-      <div className="text-xs font-semibold text-accent-foreground">เคยลงทะเบียนไว้แล้ว?</div>
-      <div className="mt-2 flex gap-2">
-        <input
-          value={code}
-          inputMode="numeric"
-          maxLength={9}
-          placeholder="กรอกรหัสนักศึกษาเพื่อดึงข้อมูลเดิม"
-          onChange={(e) => {
-            setErr("");
-            setCode(e.target.value.replace(/\D/g, "").slice(0, 9));
-          }}
-          className="min-w-0 flex-1 rounded-xl bg-card px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/40"
-        />
-        <button
-          onClick={login}
-          disabled={busy}
-          className="rounded-xl bg-primary px-3 py-2 text-xs font-semibold text-primary-foreground disabled:opacity-40"
-        >
-          {busy ? "…" : "ดึงข้อมูล"}
-        </button>
+    <div className="rounded-3xl bg-card p-6 text-center shadow-[var(--shadow-soft)]">
+      <div className="text-sm font-semibold">เข้าสู่ระบบเพื่อลงทะเบียน</div>
+      <p className="mx-auto mt-2 max-w-xs text-xs leading-relaxed text-muted-foreground">
+        ใช้บัญชี Google เพื่อยืนยันตัวตน — เปลี่ยนเครื่อง/ล้างเบราว์เซอร์แล้วยังแก้ข้อมูลตัวเองได้
+      </p>
+      <div className="mt-4 flex justify-center">
+        <div ref={btnRef} />
       </div>
-      {err && <p className="mt-1 text-[11px] text-destructive">{err}</p>}
+      <button
+        onClick={onSignIn}
+        className="mt-3 text-[11px] text-muted-foreground underline underline-offset-2"
+      >
+        ไม่เห็นปุ่ม? กดที่นี่
+      </button>
     </div>
   );
 }
@@ -767,8 +844,16 @@ function ListPanel({
                         ฉัน
                       </span>
                     )}
+                    {isAdmin && p.offRoster && (
+                      <span className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[9px] font-bold text-amber-600 dark:text-amber-400">
+                        นอกรายชื่อ
+                      </span>
+                    )}
                   </div>
-                  <div className="text-[11px] text-muted-foreground">รหัส {p.code}</div>
+                  <div className="text-[11px] text-muted-foreground">
+                    รหัส {p.code}
+                    {isAdmin && p.email ? ` · ${p.email}` : ""}
+                  </div>
                 </div>
                 {canDelete && (
                   <button
@@ -1384,6 +1469,134 @@ function RunsHistory({ adminKey }: { adminKey: string }) {
   );
 }
 
+// parse ข้อความ paste จาก Excel (mirror parseRoster ฝั่ง server) — code<sep>name ต่อบรรทัด
+function parseRosterText(text: string): { entries: RosterEntry[]; skipped: number } {
+  const entries: RosterEntry[] = [];
+  const seen = new Set<string>();
+  let skipped = 0;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const m = /^(\d{9})[\s,]+(.+)$/.exec(line);
+    if (!m || seen.has(m[1]) || !m[2].trim()) {
+      skipped++;
+      continue;
+    }
+    seen.add(m[1]);
+    entries.push({ code: m[1], name: m[2].trim().slice(0, 100) });
+  }
+  return { entries, skipped };
+}
+
+// toggle Registration Window — ปิดเพื่อแช่แข็ง choices ก่อน run (ดู docs/adr/0002)
+function RegistrationToggle({
+  open,
+  onToggle,
+  busy,
+}: {
+  open: boolean;
+  onToggle: (open: boolean) => Promise<unknown>;
+  busy: boolean;
+}) {
+  return (
+    <div className="rounded-2xl bg-card p-4 shadow-[var(--shadow-soft)]">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="text-sm font-semibold">
+            สถานะรับลงทะเบียน:{" "}
+            <span className={open ? "text-primary" : "text-amber-600 dark:text-amber-400"}>
+              {open ? "เปิด" : "ปิด"}
+            </span>
+          </div>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">
+            ปิดก่อนกดจัดสรร เพื่อล็อกไม่ให้ใครแก้อันดับระหว่างตรวจสอบ
+          </p>
+        </div>
+        <button
+          onClick={() => onToggle(!open)}
+          disabled={busy}
+          className={`shrink-0 rounded-xl px-3 py-2 text-xs font-semibold disabled:opacity-40 ${
+            open
+              ? "bg-amber-500/15 text-amber-700 dark:text-amber-400"
+              : "bg-primary text-primary-foreground"
+          }`}
+        >
+          {open ? "ปิดรับสมัคร" : "เปิดรับสมัคร"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// สรุปจำนวนคนนอกรายชื่อรุ่น (off-roster) ให้ admin ตรวจก่อน run
+function OffRosterSummary({ participants }: { participants: Participant[] }) {
+  const off = participants.filter((p) => p.offRoster);
+  if (off.length === 0) return null;
+  return (
+    <div className="rounded-2xl bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-400">
+      <b>{off.length}</b> รายลงทะเบียนด้วยรหัสที่ไม่อยู่ในรายชื่อรุ่น — ตรวจสอบก่อนจัดสรร (มีป้าย “นอกรายชื่อ” ด้านล่าง)
+    </div>
+  );
+}
+
+// import roster: paste จาก Excel → preview → บันทึกทับทั้งชุด (replace-all, ไม่แตะ participants)
+function RosterCard({
+  adminKey,
+  onSave,
+  busy,
+}: {
+  adminKey: string;
+  onSave: (roster: RosterEntry[]) => Promise<unknown>;
+  busy: boolean;
+}) {
+  const [text, setText] = useState("");
+  const [count, setCount] = useState<number | null>(null);
+  const parsed = text.trim() ? parseRosterText(text) : null;
+
+  const loadCount = () => {
+    API.getRoster({ adminKey })
+      .then((r) => setCount(r.length))
+      .catch(() => setCount(null));
+  };
+  useEffect(loadCount, [adminKey]);
+
+  const save = async () => {
+    if (!parsed || parsed.entries.length === 0) return;
+    await onSave(parsed.entries);
+    setText("");
+    loadCount();
+  };
+
+  return (
+    <div className="rounded-2xl bg-card p-4 shadow-[var(--shadow-soft)]">
+      <div className="mb-1 text-sm font-semibold">รายชื่อรุ่น (Roster)</div>
+      <p className="text-[11px] text-muted-foreground">
+        {count == null ? "—" : `มีในระบบ ${count} รายชื่อ`} · วางรายชื่อจาก Excel: รหัส 9 หลัก เว้นวรรค/แท็บ แล้วชื่อ (บรรทัดละคน)
+      </p>
+      <textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        rows={5}
+        placeholder={"611010001\tสมหญิง ใจดี\n611010002\tสมชาย รักเรียน"}
+        className="mt-2 w-full resize-y rounded-xl bg-muted px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/40"
+      />
+      {parsed && (
+        <p className="mt-1 text-[11px] text-muted-foreground">
+          อ่านได้ <b className="text-foreground">{parsed.entries.length}</b> แถว
+          {parsed.skipped > 0 && ` · ข้าม ${parsed.skipped} แถวที่รูปแบบไม่ถูก`}
+        </p>
+      )}
+      <button
+        onClick={save}
+        disabled={busy || !parsed || parsed.entries.length === 0}
+        className="mt-3 w-full rounded-xl bg-primary py-2.5 text-xs font-semibold text-primary-foreground disabled:opacity-40"
+      >
+        {busy ? "กำลังบันทึก…" : "บันทึกรายชื่อ (ทับของเดิมทั้งชุด)"}
+      </button>
+    </div>
+  );
+}
+
 function AdminView({
   state,
   busy,
@@ -1394,6 +1607,8 @@ function AdminView({
   onRun,
   onReset,
   onSaveSettings,
+  onSetRegistrationOpen,
+  onSaveRoster,
 }: {
   state: State;
   busy: boolean;
@@ -1404,6 +1619,8 @@ function AdminView({
   onRun: () => Promise<unknown>;
   onReset: () => Promise<unknown>;
   onSaveSettings: (term: string, year: string) => Promise<unknown>;
+  onSetRegistrationOpen: (open: boolean) => Promise<unknown>;
+  onSaveRoster: (roster: RosterEntry[]) => Promise<unknown>;
 }) {
   const [tab, setTab] = useState<"wards" | "list" | "results" | "history">("results");
   const [showReset, setShowReset] = useState(false);
@@ -1464,20 +1681,31 @@ function AdminView({
             {tab === "wards" && (
               <div className="space-y-3">
                 <SettingsCard settings={state.settings} onSave={onSaveSettings} busy={busy} />
+                <RosterCard adminKey={adminKey} onSave={onSaveRoster} busy={busy} />
                 <WardsAdmin wards={state.wards} onSave={onSaveWards} busy={busy} />
               </div>
             )}
             {tab === "list" && (
-              <ListPanel
-                state={state}
-                meCode=""
-                meRid=""
-                isAdmin
-                onDeleteParticipant={onDeleteParticipant}
-              />
+              <div className="space-y-3">
+                <OffRosterSummary participants={state.participants} />
+                <ListPanel
+                  state={state}
+                  meCode=""
+                  meRid=""
+                  isAdmin
+                  onDeleteParticipant={onDeleteParticipant}
+                />
+              </div>
             )}
             {tab === "results" && (
-              <ResultsPanel state={state} onRun={onRun} busy={busy} />
+              <div className="space-y-3">
+                <RegistrationToggle
+                  open={state.registrationOpen}
+                  onToggle={onSetRegistrationOpen}
+                  busy={busy}
+                />
+                <ResultsPanel state={state} onRun={onRun} busy={busy} />
+              </div>
             )}
             {tab === "history" && <RunsHistory adminKey={adminKey} />}
           </motion.div>

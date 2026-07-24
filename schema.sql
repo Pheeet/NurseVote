@@ -11,16 +11,33 @@ CREATE TABLE IF NOT EXISTS wards (
   pos       integer NOT NULL DEFAULT 0        -- ลำดับแสดงผล
 );
 
+-- Roster: รายชื่อทั้งรุ่นที่ admin นำเข้าล่วงหน้า (Student Code + ชื่อ)
+-- เป็นข้อมูล "อ้างอิง" เท่านั้น — ไม่บล็อกคนนอกรายชื่อ (soft roster, ดู docs/adr/0002)
+-- import roster ไม่สร้าง participant: roster กับ participants แยกกันเด็ดขาด
+CREATE TABLE IF NOT EXISTS roster (
+  code text PRIMARY KEY,                       -- '123456789'
+  name text NOT NULL
+);
+
 -- ผู้สมัคร (PK = รหัสนักศึกษา 9 หลัก)
+-- Ownership ผูกกับ Google Identity (google_sub) ทางเดียว — ทุก record ต้องมี google_sub
+-- (ยกเว้น record ที่ admin สร้างแทน ซึ่งมี admin เป็นเจ้าของ). ดู docs/adr/0001
 CREATE TABLE IF NOT EXISTS participants (
-  code       text PRIMARY KEY,                -- '123456789'
+  code       text PRIMARY KEY,                 -- '123456789'
   name       text NOT NULL,
-  token      text NOT NULL DEFAULT '',        -- hash ของ ownership token (แก้ไข/ลบตัวเอง)
+  google_sub text,                             -- Google 'sub' claim: 1 บัญชี = 1 รหัส (unique index ด้านล่าง)
+  email      text,                             -- ให้ admin ระบุตัวคนเท่านั้น (ไม่ขึ้น public state)
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
--- migrate: เพิ่มคอลัมน์ token สำหรับ DB เก่า
-ALTER TABLE participants ADD COLUMN IF NOT EXISTS token text NOT NULL DEFAULT '';
+-- migrate DB เก่า: เพิ่มคอลัมน์ identity, ทิ้ง token model เดิม
+-- UNIQUE index (ไม่ใช่ constraint) เพราะ Postgres มอง NULL หลายตัวเป็นคนละค่า
+-- → record ที่ admin สร้างแทน (google_sub NULL) อยู่ร่วมกันได้
+ALTER TABLE participants ADD COLUMN IF NOT EXISTS google_sub text;
+ALTER TABLE participants ADD COLUMN IF NOT EXISTS email text;
+CREATE UNIQUE INDEX IF NOT EXISTS participants_google_sub_key ON participants (google_sub);
+ALTER TABLE participants DROP COLUMN IF EXISTS token;
+ALTER TABLE participants DROP COLUMN IF EXISTS pin;
 
 -- การจัดอันดับวอร์ดของแต่ละคน (admission choices)
 CREATE TABLE IF NOT EXISTS choices (
@@ -59,10 +76,12 @@ CREATE TABLE IF NOT EXISTS settings (
   value text NOT NULL
 );
 
--- ค่าเริ่มต้นของภาค/ปีการศึกษา (ถ้ายังไม่มี)
+-- ค่าเริ่มต้น: ภาค/ปีการศึกษา + สถานะเปิดรับสมัคร (Registration Window)
+-- registration_open = 'true'|'false' — admin ปิดเพื่อแช่แข็ง choices ก่อนสั่ง run
 INSERT INTO settings (key, value) VALUES
   ('term', '2'),
-  ('year', '2569')
+  ('year', '2569'),
+  ('registration_open', 'true')
 ON CONFLICT (key) DO NOTHING;
 
 -- ---- seed วอร์ดเริ่มต้น (ถ้ายังว่าง) ----

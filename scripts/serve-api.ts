@@ -13,9 +13,15 @@ import {
   saveSettings,
   saveParticipant,
   removeParticipant,
-  participantExists,
+  getMe,
+  getRoster,
+  rosterName,
+  replaceRoster,
+  validateRoster,
+  setRegistrationOpen,
   isAdminReq,
-  participantToken,
+  verifyIdentity,
+  requireIdentity,
   MAX_BODY_BYTES,
 } from "../api/_lib.ts";
 
@@ -76,18 +82,38 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    if (p === "/api/me" && m === "GET") {
+      const identity = await requireIdentity(req);
+      return send(res, await getMe(identity), 200, { "cache-control": "private, no-store" });
+    }
+
+    if (p === "/api/roster") {
+      if (m === "GET") {
+        const code = url.searchParams.get("code") || "";
+        if (code) {
+          if (!/^\d{9}$/.test(code)) return send(res, { error: "code must be 9 digits" }, 400);
+          await requireIdentity(req);
+          return send(res, await rosterName(code), 200, { "cache-control": "private, no-store" });
+        }
+        if (!isAdminReq(req)) return send(res, { error: "admin only" }, 401);
+        return send(res, await getRoster(), 200, { "cache-control": "private, no-store" });
+      }
+      if (m === "PUT" || m === "POST") {
+        if (!isAdminReq(req)) return send(res, { error: "admin only" }, 401);
+        const b = await readBody(req);
+        const entries = validateRoster(b.roster);
+        await replaceRoster(entries);
+        return send(res, { ok: true, count: entries.length });
+      }
+    }
+
     if (p === "/api/participant") {
       const admin = isAdminReq(req);
-      const token = participantToken(req);
-      if (m === "GET") {
-        const code = url.searchParams.get("exists") || "";
-        if (!/^\d{9}$/.test(code)) return send(res, { error: "code must be 9 digits" }, 400);
-        return send(res, await participantExists(code));
-      }
+      const identity = await verifyIdentity(req);
       if (m === "DELETE") {
         const code = url.searchParams.get("code") || "";
         if (!code) return send(res, { error: "code required" }, 400);
-        return send(res, await removeParticipant(code, { token, admin }));
+        return send(res, await removeParticipant(code, { identity: identity ?? undefined, admin }));
       }
       if (m === "PUT" || m === "POST") {
         const b = await readBody(req);
@@ -95,8 +121,7 @@ const server = http.createServer(async (req, res) => {
         const name = String(b.name || "").trim();
         const choices: string[] = Array.isArray(b.choices) ? b.choices.map(String) : [];
         if (!/^\d{9}$/.test(code)) return send(res, { error: "code must be 9 digits" }, 400);
-        if (!name) return send(res, { error: "name required" }, 400);
-        return send(res, await saveParticipant(code, name, choices, { token, admin }));
+        return send(res, await saveParticipant(code, name, choices, { identity: identity ?? undefined, admin }));
       }
     }
 
@@ -109,6 +134,10 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/settings" && (m === "PUT" || m === "POST")) {
       if (!isAdminReq(req)) return send(res, { error: "admin only" }, 401);
       const b = await readBody(req);
+      if (typeof b.registrationOpen === "boolean") {
+        await setRegistrationOpen(b.registrationOpen);
+        return send(res, { ok: true });
+      }
       const { term, year } = validateSettings(b.term, b.year);
       await saveSettings(term, year);
       return send(res, { ok: true });

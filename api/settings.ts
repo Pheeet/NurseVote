@@ -1,5 +1,13 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { saveSettings, validateSettings, readBody, json, fail, isAdminReq } from "./_lib.js";
+import {
+  saveSettings,
+  validateSettings,
+  setRegistrationOpen,
+  readBody,
+  json,
+  fail,
+  isAdminReq,
+} from "./_lib.js";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
@@ -8,6 +16,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return json(res, { error: "method not allowed" }, 405);
     }
     const body = await readBody(req);
+    // toggle Registration Window (แยกจากการแก้ term/year)
+    if (typeof body.registrationOpen === "boolean") {
+      await setRegistrationOpen(body.registrationOpen);
+      return json(res, { ok: true });
+    }
     const { term, year } = validateSettings(body.term, body.year);
     await saveSettings(term, year);
     return json(res, { ok: true });

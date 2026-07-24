@@ -7,4 +7,5 @@ src/routeTree.gen.ts
 *.log
 .env
 .env.*
+!.env.example
 .vercel

@@ -1,17 +1,28 @@
 import { neon } from "@neondatabase/serverless";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
+import { jwtVerify, createRemoteJWKSet } from "jose";
 
 export type Ward = { id: string; name: string; capacity: number; pos?: number };
-export type Participant = { code: string; rid: string; name: string; choices: string[] };
+// offRoster/email เติมเฉพาะ payload admin (public state ถูก mask, ไม่มี PII)
+export type Participant = {
+  code: string;
+  rid: string;
+  name: string;
+  choices: string[];
+  offRoster?: boolean;
+  email?: string | null;
+};
 export type Assignment = { code: string; rid?: string; wardId: string | null; rank: number | null };
 export type Settings = { term: string; year: string };
+export type RosterEntry = { code: string; name: string };
 export type State = {
   wards: Ward[];
   participants: Participant[];
   assignments: Assignment[] | null;
   runAt: string | null;
   settings: Settings;
+  registrationOpen: boolean;
 };
 
 type Row = Record<string, any>;
@@ -94,9 +105,6 @@ export function validateSettings(rawTerm: unknown, rawYear: unknown): { term: st
   return { term, year };
 }
 
-function hashToken(t: string) {
-  return createHash("sha256").update(t).digest("hex");
-}
 function safeEqual(a: string, b: string) {
   const x = new TextEncoder().encode(a);
   const y = new TextEncoder().encode(b);
@@ -116,10 +124,47 @@ export function isAdminReq(req: ReqLike): boolean {
   return safeEqual(k, Array.isArray(sent) ? sent[0] : sent);
 }
 
-export function participantToken(req: ReqLike): string | undefined {
-  const h = req.headers?.["x-participant-token"];
-  if (!h) return undefined;
-  return Array.isArray(h) ? h[0] : h;
+/* ============ Google Identity (ownership proof ทางเดียว) ============ */
+
+export type Identity = { sub: string; email: string | null };
+
+// JWKS cache ใน memory ต่อ instance — verify ไม่ยิง network หลัง warm (สำคัญตอน 500 concurrent)
+const GOOGLE_JWKS = createRemoteJWKSet(new URL("https://www.googleapis.com/oauth2/v3/certs"));
+
+function bearer(req: ReqLike): string | undefined {
+  const h = req.headers?.["authorization"] ?? req.headers?.["Authorization"];
+  const v = Array.isArray(h) ? h[0] : h;
+  if (!v) return undefined;
+  const m = /^Bearer\s+(.+)$/i.exec(v);
+  return m ? m[1] : undefined;
+}
+
+// verify Google ID token (JWT) กับ JWKS ของ Google; คืน Identity หรือ null ถ้าไม่มี token
+// โยน 401 ถ้า token มีแต่ verify ไม่ผ่าน (หมดอายุ/ปลอม/ผิด audience)
+export async function verifyIdentity(req: ReqLike): Promise<Identity | null> {
+  const token = bearer(req);
+  if (!token) return null;
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  if (!clientId) throw new HttpError(500, "GOOGLE_CLIENT_ID not set");
+  try {
+    const { payload } = await jwtVerify(token, GOOGLE_JWKS, {
+      issuer: ["https://accounts.google.com", "accounts.google.com"],
+      audience: clientId,
+    });
+    if (!payload.sub) throw new HttpError(401, "invalid token");
+    const email = typeof payload.email === "string" ? payload.email : null;
+    return { sub: payload.sub, email };
+  } catch (e) {
+    if (e instanceof HttpError) throw e;
+    throw new HttpError(401, "เข้าสู่ระบบใหม่อีกครั้ง");
+  }
+}
+
+// บังคับต้อง login (ใช้กับ endpoint ที่ต้องมีตัวตน)
+export async function requireIdentity(req: ReqLike): Promise<Identity> {
+  const id = await verifyIdentity(req);
+  if (!id) throw new HttpError(401, "ต้องเข้าสู่ระบบด้วย Google ก่อน");
+  return id;
 }
 
 export function fail(res: VercelResponse, e: any) {
@@ -136,6 +181,19 @@ export async function saveSettings(term: string, year: string) {
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`;
   await sql`INSERT INTO settings (key, value) VALUES ('year', ${year})
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`;
+}
+
+// Registration Window: true = participant สร้าง/แก้ตัวเองได้, false = แช่แข็ง (admin bypass เสมอ)
+export async function setRegistrationOpen(open: boolean) {
+  const sql = db();
+  await sql`INSERT INTO settings (key, value) VALUES ('registration_open', ${open ? "true" : "false"})
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`;
+}
+
+async function isRegistrationOpen(sql: ReturnType<typeof db>): Promise<boolean> {
+  const rows = (await sql`SELECT value FROM settings WHERE key = 'registration_open'`) as Row[];
+  // default เปิด ถ้ายังไม่เคยตั้ง
+  return rows.length ? rows[0].value !== "false" : true;
 }
 
 const DEFAULT_WARDS: Ward[] = [
@@ -173,8 +231,11 @@ export async function getState(opts: { admin: boolean } = { admin: false }): Pro
     SELECT
       (SELECT coalesce(json_agg(json_build_object('id',id,'name',name,'capacity',capacity,'pos',pos) ORDER BY pos, id), '[]'::json)
          FROM wards) AS wards,
-      (SELECT coalesce(json_agg(json_build_object('code',code,'name',name) ORDER BY created_at, code), '[]'::json)
-         FROM participants) AS participants,
+      (SELECT coalesce(json_agg(json_build_object(
+                'code',p.code,'name',p.name,'email',p.email,
+                'off_roster',NOT EXISTS (SELECT 1 FROM roster ro WHERE ro.code = p.code)
+              ) ORDER BY p.created_at, p.code), '[]'::json)
+         FROM participants p) AS participants,
       (SELECT coalesce(json_agg(json_build_object('participant_code',participant_code,'ward_id',ward_id,'rank',rank) ORDER BY participant_code, rank), '[]'::json)
          FROM choices) AS choices,
       (SELECT row_to_json(r) FROM (SELECT id, created_at FROM runs ORDER BY id DESC LIMIT 1) r) AS latest_run,
@@ -195,6 +256,7 @@ export async function getState(opts: { admin: boolean } = { admin: false }): Pro
     term: settingsMap.term ?? DEFAULT_SETTINGS.term,
     year: settingsMap.year ?? DEFAULT_SETTINGS.year,
   };
+  const registrationOpen = settingsMap.registration_open !== "false";
 
   const choiceMap = new Map<string, string[]>();
   for (const c of choices) {
@@ -221,10 +283,13 @@ export async function getState(opts: { admin: boolean } = { admin: false }): Pro
       rid: rowId(p.code),
       name: p.name,
       choices: choiceMap.get(p.code) ?? [],
+      // email/offRoster เฉพาะ admin — public state ห้ามรั่ว PII/roster status
+      ...(opts.admin ? { email: p.email ?? null, offRoster: !!p.off_roster } : {}),
     })),
     assignments,
     runAt,
     settings,
+    registrationOpen,
   };
 }
 
@@ -261,50 +326,151 @@ export async function saveParticipant(
   code: string,
   name: string,
   choices: string[],
-  opts: { token?: string; admin: boolean },
-): Promise<{ ok: true; token?: string; rid: string }> {
+  opts: { identity?: Identity; admin: boolean },
+): Promise<{ ok: true; rid: string; code: string; name: string; choices: string[]; offRoster: boolean }> {
   const sql = db();
-  const safeName = name.slice(0, NAME_MAX);
   const safeChoices = validateChoices(choices);
-  const existing = (await sql`SELECT token FROM participants WHERE code = ${code}`) as Row[];
+  const existing = (await sql`SELECT google_sub FROM participants WHERE code = ${code}`) as Row[];
+
+  // roster เป็น source of truth ของชื่อ: อยู่ใน roster → ใช้ชื่อ roster, นอก roster → ใช้ชื่อที่กรอก
+  const rosterRow = (await sql`SELECT name FROM roster WHERE code = ${code}`) as Row[];
+  const inRoster = rosterRow.length > 0;
+  const finalName = (inRoster ? String(rosterRow[0].name) : name).slice(0, NAME_MAX);
+  if (!finalName.trim()) throw new HttpError(400, "name required");
 
   if (existing.length) {
-    const allowed =
-      opts.admin ||
-      (!!opts.token && !!existing[0].token && safeEqual(hashToken(opts.token), existing[0].token));
-    if (!allowed) throw new HttpError(403, "ไม่ใช่เจ้าของข้อมูล");
-    await sql`UPDATE participants SET name = ${safeName} WHERE code = ${code}`;
+    // แก้ข้อมูลเดิม: ต้องเป็นเจ้าของ (google_sub ตรง) หรือ admin
+    const ownedByMe = !!opts.identity && existing[0].google_sub === opts.identity.sub;
+    if (!opts.admin && !ownedByMe) {
+      // รหัสถูกจองโดยบัญชีอื่น — ข้อความแบบ 12(C) ให้ผู้ใช้ลองสลับบัญชี
+      throw new HttpError(
+        409,
+        "รหัสนี้ลงทะเบียนไว้แล้ว ถ้าเป็นคุณ ลองเข้าสู่ระบบด้วยบัญชี Google อื่นที่เคยใช้",
+      );
+    }
+    if (!opts.admin && !(await isRegistrationOpen(sql))) {
+      throw new HttpError(403, "ปิดรับสมัคร/แก้ไขแล้ว");
+    }
+    await sql`UPDATE participants SET name = ${finalName} WHERE code = ${code}`;
     await applyChoices(sql, code, safeChoices);
-    return { ok: true, rid: rowId(code) };
+    return { ok: true, rid: rowId(code), code, name: finalName, choices: safeChoices, offRoster: !inRoster };
   }
 
-  // สมัครใหม่: สร้าง ownership token ส่งกลับให้ client เก็บ
-  const token = randomBytes(24).toString("hex");
-  await sql`INSERT INTO participants (code, name, token) VALUES (${code}, ${safeName}, ${hashToken(token)})`;
+  // สมัครใหม่
+  if (!opts.admin) {
+    if (!opts.identity) throw new HttpError(401, "ต้องเข้าสู่ระบบด้วย Google ก่อน");
+    if (!(await isRegistrationOpen(sql))) throw new HttpError(403, "ปิดรับสมัครแล้ว");
+    // 1 บัญชี = 1 รหัส: บัญชีนี้จองรหัสอื่นไว้แล้วหรือยัง
+    const owned = (await sql`SELECT code FROM participants WHERE google_sub = ${opts.identity.sub}`) as Row[];
+    if (owned.length) {
+      throw new HttpError(409, `บัญชี Google นี้ลงทะเบียนรหัส ${owned[0].code} ไว้แล้ว`);
+    }
+  }
+  const sub = opts.identity?.sub ?? null;   // admin สร้างแทน → NULL (admin เป็นเจ้าของ)
+  const email = opts.identity?.email ?? null;
+  await sql`INSERT INTO participants (code, name, google_sub, email)
+            VALUES (${code}, ${finalName}, ${sub}, ${email})`;
   await applyChoices(sql, code, safeChoices);
-  return { ok: true, token, rid: rowId(code) };
+  return { ok: true, rid: rowId(code), code, name: finalName, choices: safeChoices, offRoster: !inRoster };
 }
 
-// เช็คว่ารหัสนี้มีในระบบไหม (ไม่คืน PII อื่น) + คืน rid ของรหัสที่ query มา
-export async function participantExists(code: string): Promise<{ exists: boolean; rid: string }> {
+// participant ที่ Identity นี้เป็นเจ้าของ (คืนรหัสเต็ม — ผู้ใช้ดูของตัวเองได้)
+export async function getMe(
+  identity: Identity,
+): Promise<{ registered: boolean; code?: string; rid?: string; name?: string; choices?: string[]; offRoster?: boolean }> {
   const sql = db();
-  const rows = (await sql`SELECT 1 FROM participants WHERE code = ${code}`) as Row[];
-  return { exists: rows.length > 0, rid: rowId(code) };
+  const rows = (await sql`SELECT code, name FROM participants WHERE google_sub = ${identity.sub}`) as Row[];
+  if (!rows.length) return { registered: false };
+  const code = rows[0].code as string;
+  const ch = (await sql`SELECT ward_id FROM choices WHERE participant_code = ${code} ORDER BY rank`) as Row[];
+  const inRoster = ((await sql`SELECT 1 FROM roster WHERE code = ${code}`) as Row[]).length > 0;
+  return {
+    registered: true,
+    code,
+    rid: rowId(code),
+    name: rows[0].name,
+    choices: ch.map((c) => c.ward_id),
+    offRoster: !inRoster,
+  };
 }
 
 export async function removeParticipant(
   code: string,
-  opts: { token?: string; admin: boolean },
+  opts: { identity?: Identity; admin: boolean },
 ): Promise<{ ok: true }> {
   const sql = db();
-  const existing = (await sql`SELECT token FROM participants WHERE code = ${code}`) as Row[];
+  const existing = (await sql`SELECT google_sub FROM participants WHERE code = ${code}`) as Row[];
   if (!existing.length) return { ok: true };
-  const allowed =
-    opts.admin ||
-    (!!opts.token && !!existing[0].token && safeEqual(hashToken(opts.token), existing[0].token));
-  if (!allowed) throw new HttpError(403, "ไม่ใช่เจ้าของข้อมูล");
+  const ownedByMe = !!opts.identity && existing[0].google_sub === opts.identity.sub;
+  if (!opts.admin && !ownedByMe) throw new HttpError(403, "ไม่ใช่เจ้าของข้อมูล");
+  if (!opts.admin && !(await isRegistrationOpen(sql))) throw new HttpError(403, "ปิดรับสมัคร/แก้ไขแล้ว");
   await sql`DELETE FROM participants WHERE code = ${code}`;
   return { ok: true };
+}
+
+/* ============ Roster (soft allowlist — flag ไม่บล็อก) ============ */
+
+// parse ข้อความที่ paste จาก Excel: ต่อบรรทัด = "code<tab|comma|ช่องว่าง>name"
+// คืน { entries, skipped } — skipped = จำนวนแถวที่รูปแบบไม่ถูก (ให้ admin เห็นก่อนยืนยัน)
+export function parseRoster(text: string): { entries: RosterEntry[]; skipped: number } {
+  const entries: RosterEntry[] = [];
+  const seen = new Set<string>();
+  let skipped = 0;
+  for (const raw of String(text).split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const m = /^(\d{9})[\s,]+(.+)$/.exec(line);
+    if (!m) {
+      skipped++;
+      continue;
+    }
+    const code = m[1];
+    const name = m[2].trim().slice(0, NAME_MAX);
+    if (!name || seen.has(code)) {
+      skipped++;
+      continue;
+    }
+    seen.add(code);
+    entries.push({ code, name });
+  }
+  return { entries, skipped };
+}
+
+export function validateRoster(raw: unknown): RosterEntry[] {
+  if (!Array.isArray(raw)) bad("roster must be an array");
+  if (raw.length > 5000) bad("roster too large");
+  const out: RosterEntry[] = [];
+  const seen = new Set<string>();
+  for (const e of raw as any[]) {
+    const code = String(e?.code ?? "").trim();
+    const name = String(e?.name ?? "").trim().slice(0, NAME_MAX);
+    if (!/^\d{9}$/.test(code)) bad("invalid roster code");
+    if (!name) bad("roster name required");
+    if (seen.has(code)) continue;
+    seen.add(code);
+    out.push({ code, name });
+  }
+  return out;
+}
+
+// แทนที่ roster ทั้งชุด (replace-all) — ไม่แตะ participants เด็ดขาด
+export async function replaceRoster(entries: RosterEntry[]) {
+  const sql = db();
+  await sql`DELETE FROM roster`;
+  await bulkInsert(sql, "roster", ["code", "name"], entries.map((e) => [e.code, e.name]));
+}
+
+export async function getRoster(): Promise<RosterEntry[]> {
+  const sql = db();
+  const rows = (await sql`SELECT code, name FROM roster ORDER BY code`) as Row[];
+  return rows.map((r) => ({ code: r.code, name: r.name }));
+}
+
+// name auto-fill: คืนชื่อจาก roster ตามรหัส (ไม่บอกสถานะลงทะเบียน = ไม่เป็น oracle ให้ squatter)
+export async function rosterName(code: string): Promise<{ found: boolean; name?: string }> {
+  const sql = db();
+  const rows = (await sql`SELECT name FROM roster WHERE code = ${code}`) as Row[];
+  return rows.length ? { found: true, name: rows[0].name } : { found: false };
 }
 
 export async function replaceWards(wards: Ward[]) {
