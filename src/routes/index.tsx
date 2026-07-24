@@ -755,7 +755,7 @@ function LoginGate({ onSignIn }: { onSignIn: () => void }) {
     <div className="rounded-3xl bg-card p-6 text-center shadow-[var(--shadow-soft)]">
       <div className="text-sm font-semibold">เข้าสู่ระบบเพื่อลงทะเบียน</div>
       <p className="mx-auto mt-2 max-w-xs text-xs leading-relaxed text-muted-foreground">
-        ใช้บัญชี Google เพื่อยืนยันตัวตน — เปลี่ยนเครื่อง/ล้างเบราว์เซอร์แล้วยังแก้ข้อมูลตัวเองได้
+        ลงชื่อเข้าใช้ด้วย Google เพื่อยืนยันตัวตนและแก้ไขข้อมูล
       </p>
       <div className="mt-4 flex justify-center">
         <div ref={btnRef} />
