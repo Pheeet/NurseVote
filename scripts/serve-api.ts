@@ -23,6 +23,10 @@ import {
   verifyIdentity,
   requireIdentity,
   MAX_BODY_BYTES,
+  listWardTemplates,
+  saveWardTemplate,
+  deleteWardTemplate,
+  validateTemplate,
 } from "../api/_lib.ts";
 
 const env = new URL("../.env", import.meta.url);
@@ -130,6 +134,23 @@ const server = http.createServer(async (req, res) => {
       const b = await readBody(req);
       await replaceWards(validateWards(b.wards));
       return send(res, { ok: true });
+    }
+    if (p === "/api/ward-templates") {
+      if (!isAdminReq(req)) return send(res, { error: "admin only" }, 401);
+      if (m === "GET") {
+        return send(res, await listWardTemplates(), 200, { "cache-control": "private, no-store" });
+      }
+      if (m === "PUT" || m === "POST") {
+        const b = await readBody(req);
+        await saveWardTemplate(validateTemplate(b));
+        return send(res, { ok: true });
+      }
+      if (m === "DELETE") {
+        const id = url.searchParams.get("id") || "";
+        if (!id) return send(res, { error: "id required" }, 400);
+        await deleteWardTemplate(id);
+        return send(res, { ok: true });
+      }
     }
     if (p === "/api/settings" && (m === "PUT" || m === "POST")) {
       if (!isAdminReq(req)) return send(res, { error: "admin only" }, 401);
