@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { motion, AnimatePresence, LayoutGroup } from "framer-motion";
 import {
   googleEnabled,
@@ -15,6 +15,8 @@ export const Route = createFileRoute("/")({
 });
 
 type Ward = { id: string; name: string; capacity: number; pos?: number };
+// เทมเพลต = preset ชุดวอร์ดตั้งชื่อ (wards ไม่มี pos)
+type WardTemplate = { id: string; name: string; wards: Ward[] };
 // code = public (masked สำหรับ non-admin), rid = opaque id ใช้จับคู่ตัวตน
 // offRoster/email เติมเฉพาะ payload admin
 type Participant = {
@@ -108,6 +110,22 @@ const API = {
       headers: { "content-type": "application/json", "x-admin-key": auth.adminKey },
       body: JSON.stringify({ wards }),
     }).then(json),
+  getWardTemplates: (auth: { adminKey: string }) =>
+    fetch("/api/ward-templates", {
+      headers: { "x-admin-key": auth.adminKey },
+      cache: "no-store",
+    }).then<WardTemplate[]>(json),
+  saveWardTemplate: (t: WardTemplate, auth: { adminKey: string }) =>
+    fetch("/api/ward-templates", {
+      method: "PUT",
+      headers: { "content-type": "application/json", "x-admin-key": auth.adminKey },
+      body: JSON.stringify(t),
+    }).then(json),
+  deleteWardTemplate: (id: string, auth: { adminKey: string }) =>
+    fetch(`/api/ward-templates?id=${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: { "x-admin-key": auth.adminKey },
+    }).then(json),
   saveSettings: (term: string, year: string, title: string, auth: { adminKey: string }) =>
     fetch("/api/settings", {
       method: "PUT",
@@ -139,11 +157,22 @@ const API = {
     fetch("/api/run", {
       headers: auth?.adminKey ? { "x-admin-key": auth.adminKey } : {},
     }).then<RunSummary[]>(json),
-  reset: (auth: { adminKey: string }) =>
-    fetch("/api/reset", { method: "POST", headers: { "x-admin-key": auth.adminKey } }).then(json),
+  reset: (scope: string, auth: { adminKey: string }) =>
+    fetch(`/api/reset?scope=${encodeURIComponent(scope)}`, {
+      method: "POST",
+      headers: { "x-admin-key": auth.adminKey },
+    }).then(json),
 };
 
 const uid = () => Math.random().toString(36).slice(2, 10);
+
+// toast message หลัง reset ตามขอบเขต
+const RESET_MSG: Record<"participants" | "runs" | "wards" | "roster", string> = {
+  participants: "ลบผู้ลงทะเบียนทั้งหมดเรียบร้อยแล้ว",
+  runs: "ล้างผลการจัดสรรเรียบร้อยแล้ว",
+  wards: "รีเซ็ตวอร์ดเป็นค่าเริ่มต้นเรียบร้อยแล้ว",
+  roster: "ล้างรายชื่อรุ่นเรียบร้อยแล้ว",
+};
 
 function Index() {
   const [state, setState] = useState<State | null>(null);
@@ -290,7 +319,11 @@ function Index() {
   const onSaveWards = (wards: Ward[]) =>
     runBusy(() => API.saveWards(wards, { adminKey }), "บันทึกวอร์ดเรียบร้อยแล้ว");
   const onRun = () => runBusy(() => API.run({ adminKey }), "จัดสรรเสร็จเรียบร้อย");
-  const onReset = () => runBusy(() => API.reset({ adminKey }), "ล้างข้อมูลเรียบร้อยแล้ว");
+  const onResetScope = (scope: "participants" | "runs" | "wards" | "roster") =>
+    runBusy(
+      () => API.reset(scope, { adminKey }),
+      RESET_MSG[scope],
+    );
   const onSaveSettings = (term: string, year: string, title: string) =>
     runBusy(() => API.saveSettings(term, year, title, { adminKey }), "บันทึกการตั้งค่าเรียบร้อยแล้ว");
   const onSetRegistrationOpen = (open: boolean) =>
@@ -375,10 +408,11 @@ function Index() {
           onSaveWards={onSaveWards}
           onDeleteParticipant={onDeleteParticipant}
           onRun={onRun}
-          onReset={onReset}
+          onReset={onResetScope}
           onSaveSettings={onSaveSettings}
           onSetRegistrationOpen={onSetRegistrationOpen}
           onSaveRoster={onSaveRoster}
+          notify={showToast}
         />
       )}
 
@@ -903,13 +937,19 @@ function WardsAdmin({
   wards,
   onSave,
   busy,
+  adminKey,
+  notify,
 }: {
   wards: Ward[];
   onSave: (wards: Ward[]) => Promise<unknown>;
   busy: boolean;
+  adminKey: string;
+  notify: (msg: string, type?: "ok" | "err") => void;
 }) {
   const [draft, setDraft] = useState<Ward[]>(wards);
   const [saved, setSaved] = useState(true);
+  const [tpls, setTpls] = useState<WardTemplate[]>([]);
+  const [tplBusy, setTplBusy] = useState(false);
 
   // sync draft เฉพาะตอน "เนื้อหา" wards เปลี่ยนจริง (ไม่ใช่ทุก refresh/poll)
   // ถ้าผูกกับ `wards` (array ref) → polling ทุก 5s จะ reset ทับที่ admin กำลังพิมพ์
@@ -919,6 +959,13 @@ function WardsAdmin({
     setSaved(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wardsSig]);
+
+  const loadTpls = () => {
+    API.getWardTemplates({ adminKey })
+      .then(setTpls)
+      .catch(() => notify("โหลดเทมเพลตไม่สำเร็จ", "err"));
+  };
+  useEffect(loadTpls, [adminKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const markDirty = (next: Ward[]) => {
     setDraft(next);
@@ -935,6 +982,61 @@ function WardsAdmin({
   const save = async () => {
     await onSave(draft);
     setSaved(true);
+  };
+
+  // popup ตั้งชื่อเทมเพลต
+  const [naming, setNaming] = useState(false);
+  const [tplName, setTplName] = useState("");
+
+  const confirmSaveTpl = async () => {
+    const name = tplName.trim();
+    if (!name) return;
+    setTplBusy(true);
+    try {
+      await API.saveWardTemplate(
+        {
+          id: uid(),
+          name,
+          // strip pos — เก็บเฉพาะ id/name/capacity
+          wards: draft.map(({ id, name: n, capacity }) => ({ id, name: n, capacity })),
+        },
+        { adminKey },
+      );
+      loadTpls();
+      notify("บันทึกเทมเพลตแล้ว");
+      setNaming(false);
+    } catch (e: any) {
+      notify(e?.message || "บันทึกเทมเพลตไม่สำเร็จ", "err");
+    } finally {
+      setTplBusy(false);
+    }
+  };
+
+  // popup ยืนยันโหลด/ลบเทมเพลต (loadingTpl / deletingTpl = เทมเพลตที่กำลังถูกถาม)
+  const [loadingTpl, setLoadingTpl] = useState<WardTemplate | null>(null);
+  const [deletingTpl, setDeletingTpl] = useState<WardTemplate | null>(null);
+
+  const confirmLoadTpl = () => {
+    if (!loadingTpl) return;
+    setDraft(loadingTpl.wards);
+    setSaved(false);
+    notify(`โหลด "${loadingTpl.name}" แล้ว — กดบันทึกเพื่อใช้งาน`);
+    setLoadingTpl(null);
+  };
+
+  const confirmDelTpl = async () => {
+    if (!deletingTpl) return;
+    setTplBusy(true);
+    try {
+      await API.deleteWardTemplate(deletingTpl.id, { adminKey });
+      loadTpls();
+      notify("ลบเทมเพลตแล้ว");
+      setDeletingTpl(null);
+    } catch (e: any) {
+      notify(e?.message || "ลบเทมเพลตไม่สำเร็จ", "err");
+    } finally {
+      setTplBusy(false);
+    }
   };
 
   return (
@@ -983,6 +1085,105 @@ function WardsAdmin({
       >
         {saved ? "บันทึกแล้ว" : "บันทึก"}
       </button>
+
+      {/* เทมเพลตวอร์ด: preset ชุดวอร์ดตั้งชื่อ โหลดกลับมาแก้/บันทึกได้ */}
+      <div className="rounded-2xl border border-border bg-card p-3">
+        <div className="mb-2 text-xs font-semibold text-muted-foreground">เทมเพลตวอร์ด</div>
+        {tpls.length === 0 ? (
+          <p className="text-[11px] text-muted-foreground">ยังไม่มีเทมเพลต — เซฟชุดวอร์ดปัจจุบันเพื่อใช้ซ้ำ</p>
+        ) : (
+          <div className="space-y-1.5">
+            {tpls.map((t) => (
+              <div key={t.id} className="flex items-center gap-2 rounded-xl bg-muted/50 px-3 py-2">
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm font-medium">{t.name}</div>
+                  <div className="text-[11px] text-muted-foreground">{t.wards.length} วอร์ด</div>
+                </div>
+                <button
+                  onClick={() => setLoadingTpl(t)}
+                  disabled={tplBusy}
+                  className="rounded-lg bg-primary/10 px-2.5 py-1 text-xs font-medium text-primary hover:bg-primary/20 disabled:opacity-40"
+                >
+                  โหลด
+                </button>
+                <button
+                  onClick={() => setDeletingTpl(t)}
+                  disabled={tplBusy}
+                  className="rounded-lg px-2 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-40"
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        <button
+          onClick={() => setNaming(true)}
+          disabled={tplBusy || draft.length === 0}
+          className="mt-2.5 w-full rounded-xl border-2 border-dashed border-border py-2 text-xs font-medium text-muted-foreground hover:border-primary hover:text-primary disabled:opacity-40"
+        >
+          + บันทึกเป็นเทมเพลต
+        </button>
+      </div>
+
+      {naming && (
+        <Modal onClose={() => !tplBusy && setNaming(false)}>
+          <div className="rounded-3xl bg-card p-6 shadow-[var(--shadow-soft)]">
+            <div className="text-base font-semibold">ตั้งชื่อเทมเพลต</div>
+            <input
+              autoFocus
+              value={tplName}
+              onChange={(e) => setTplName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && tplName.trim() && !tplBusy) confirmSaveTpl();
+              }}
+              placeholder="เช่น เทอม 1/67"
+              className="mt-3 w-full rounded-2xl bg-muted px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-primary/40"
+            />
+            <div className="mt-5 flex gap-2">
+              <button
+                onClick={() => setNaming(false)}
+                disabled={tplBusy}
+                className="flex-1 rounded-2xl bg-muted py-3 text-sm font-semibold text-muted-foreground disabled:opacity-40"
+              >
+                ยกเลิก
+              </button>
+              <button
+                onClick={confirmSaveTpl}
+                disabled={tplBusy || !tplName.trim()}
+                className="flex-1 rounded-2xl bg-primary py-3 text-sm font-semibold text-primary-foreground disabled:opacity-40"
+              >
+                {tplBusy ? "กำลังบันทึก…" : "บันทึก"}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {loadingTpl && (
+        <ConfirmModal
+          title={`โหลด "${loadingTpl.name}"`}
+          message={
+            saved
+              ? `โหลดเทมเพลต (${loadingTpl.wards.length} วอร์ด) เข้าตัวแก้ไข — กด "บันทึก" ภายหลังเพื่อใช้งานจริง`
+              : `การแก้ไขวอร์ดปัจจุบันยังไม่ได้บันทึก โหลดเทมเพลตทับเลยไหม? (${loadingTpl.wards.length} วอร์ด)`
+          }
+          confirmLabel="โหลด"
+          onConfirm={confirmLoadTpl}
+          onClose={() => setLoadingTpl(null)}
+        />
+      )}
+
+      {deletingTpl && (
+        <ConfirmModal
+          title={`ลบเทมเพลต "${deletingTpl.name}"?`}
+          message="ลบแล้วไม่สามารถกู้คืนได้"
+          confirmLabel="ลบ"
+          busy={tplBusy}
+          onConfirm={confirmDelTpl}
+          onClose={() => !tplBusy && setDeletingTpl(null)}
+        />
+      )}
     </div>
   );
 }
@@ -1560,59 +1761,273 @@ function OffRosterSummary({ participants }: { participants: Participant[] }) {
 }
 
 // import roster: paste จาก Excel → preview → บันทึกทับทั้งชุด (replace-all, ไม่แตะ participants)
+// count/reload มาจาก RosterPanel ที่ถือ roster ทั้งชุด (แหล่งเดียว ไม่ยิงซ้ำ)
 function RosterCard({
-  adminKey,
+  count,
   onSave,
+  onSaved,
   busy,
 }: {
-  adminKey: string;
+  count: number | null;
   onSave: (roster: RosterEntry[]) => Promise<unknown>;
+  onSaved: () => void;
   busy: boolean;
 }) {
   const [text, setText] = useState("");
-  const [count, setCount] = useState<number | null>(null);
+  const [open, setOpen] = useState(false);
   const parsed = text.trim() ? parseRosterText(text) : null;
-
-  const loadCount = () => {
-    API.getRoster({ adminKey })
-      .then((r) => setCount(r.length))
-      .catch(() => setCount(null));
-  };
-  useEffect(loadCount, [adminKey]);
 
   const save = async () => {
     if (!parsed || parsed.entries.length === 0) return;
     await onSave(parsed.entries);
     setText("");
-    loadCount();
+    onSaved();
   };
 
   return (
-    <div className="rounded-2xl bg-card p-4 shadow-[var(--shadow-soft)]">
-      <div className="mb-1 text-sm font-semibold">รายชื่อรุ่น (Roster)</div>
-      <p className="text-[11px] text-muted-foreground">
-        {count == null ? "—" : `มีในระบบ ${count} รายชื่อ`} · วางรายชื่อจาก Excel: รหัส 9 หลัก เว้นวรรค/แท็บ แล้วชื่อ (บรรทัดละคน)
-      </p>
-      <textarea
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        rows={5}
-        placeholder={"611010001\tสมหญิง ใจดี\n611010002\tสมชาย รักเรียน"}
-        className="mt-2 w-full resize-y rounded-xl bg-muted px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/40"
-      />
-      {parsed && (
-        <p className="mt-1 text-[11px] text-muted-foreground">
-          อ่านได้ <b className="text-foreground">{parsed.entries.length}</b> แถว
-          {parsed.skipped > 0 && ` · ข้าม ${parsed.skipped} แถวที่รูปแบบไม่ถูก`}
-        </p>
-      )}
+    <div className="overflow-hidden rounded-2xl bg-card shadow-[var(--shadow-soft)]">
       <button
-        onClick={save}
-        disabled={busy || !parsed || parsed.entries.length === 0}
-        className="mt-3 w-full rounded-xl bg-primary py-2.5 text-xs font-semibold text-primary-foreground disabled:opacity-40"
+        onClick={() => setOpen(!open)}
+        className="flex w-full items-center justify-between gap-2 px-4 py-3 text-left"
       >
-        {busy ? "กำลังบันทึก…" : "บันทึกรายชื่อ (ทับของเดิมทั้งชุด)"}
+        <div className="min-w-0">
+          <div className="text-sm font-semibold">นำเข้ารายชื่อรุ่น</div>
+          <div className="text-[11px] text-muted-foreground">
+            {count == null ? "—" : `ตอนนี้มี ${count} รายชื่อ`} · วางจาก Excel ทับของเดิมทั้งชุด
+          </div>
+        </div>
+        <span
+          className={`shrink-0 text-muted-foreground transition-transform ${open ? "rotate-180" : ""}`}
+        >
+          ▾
+        </span>
       </button>
+
+      {open && (
+        <div className="border-t border-border/60 px-4 pb-4 pt-3">
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            รูปแบบ: รหัส 9 หลัก · เว้นวรรคหรือแท็บ · ชื่อ — บรรทัดละคน
+          </p>
+          <textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            rows={5}
+            placeholder={"611010001\tสมหญิง ใจดี\n611010002\tสมชาย รักเรียน"}
+            className="mt-2 w-full resize-y rounded-xl bg-muted px-3 py-2 font-mono text-[13px] leading-relaxed outline-none focus:ring-2 focus:ring-primary/40"
+          />
+          {parsed && (
+            <p className="mt-1.5 text-[11px] text-muted-foreground">
+              อ่านได้ <b className="text-foreground">{parsed.entries.length}</b> แถว
+              {parsed.skipped > 0 && (
+                <span className="text-amber-600 dark:text-amber-400">
+                  {" "}
+                  · ข้าม {parsed.skipped} แถวที่รูปแบบไม่ถูก
+                </span>
+              )}
+            </p>
+          )}
+          <button
+            onClick={save}
+            disabled={busy || !parsed || parsed.entries.length === 0}
+            className="mt-3 w-full rounded-xl bg-primary py-2.5 text-xs font-semibold text-primary-foreground disabled:opacity-40"
+          >
+            {busy ? "กำลังบันทึก…" : "บันทึกรายชื่อ (ทับของเดิมทั้งชุด)"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// tab "Roster": ตาราง roster จาก DB (source of truth) + import + ล้างทั้งชุด
+// ทำเครื่องหมาย "ลงทะเบียนแล้ว" โดยเทียบ code กับ participants (admin payload มี code เต็ม)
+function RosterPanel({
+  adminKey,
+  participants,
+  onSave,
+  onReset,
+  busy,
+}: {
+  adminKey: string;
+  participants: Participant[];
+  onSave: (roster: RosterEntry[]) => Promise<unknown>;
+  onReset: () => Promise<unknown>;
+  busy: boolean;
+}) {
+  const [roster, setRoster] = useState<RosterEntry[] | null>(null);
+  const [err, setErr] = useState("");
+  const [q, setQ] = useState("");
+  const [filter, setFilter] = useState<"all" | "reg" | "unreg">("all");
+
+  const load = async () => {
+    try {
+      setErr("");
+      setRoster(await API.getRoster({ adminKey }));
+    } catch (e: any) {
+      setErr(e.message || "โหลดไม่ได้");
+    }
+  };
+  useEffect(() => {
+    load();
+  }, [adminKey]);
+
+  const registered = useMemo(
+    () => new Set(participants.map((p) => p.code)),
+    [participants],
+  );
+  const rows = useMemo(() => {
+    const term = q.trim().toLowerCase();
+    return (roster ?? []).filter((r) => {
+      const reg = registered.has(r.code);
+      if (filter === "reg" && !reg) return false;
+      if (filter === "unreg" && reg) return false;
+      if (!term) return true;
+      return r.code.includes(term) || r.name.toLowerCase().includes(term);
+    });
+  }, [roster, q, filter, registered]);
+  const total = roster?.length ?? 0;
+  const regCount = useMemo(
+    () => (roster ?? []).filter((r) => registered.has(r.code)).length,
+    [roster, registered],
+  );
+
+  return (
+    <div className="space-y-3">
+      {/* สรุปตัวเลขรวม: ทั้งรุ่น / ลงแล้ว / ยังไม่ลง */}
+      <div className="grid grid-cols-3 gap-2">
+        {[
+          { label: "ทั้งรุ่น", value: total, tone: "text-foreground" },
+          { label: "ลงทะเบียนแล้ว", value: regCount, tone: "text-primary" },
+          { label: "ยังไม่ลง", value: total - regCount, tone: "text-muted-foreground" },
+        ].map((s) => (
+          <div
+            key={s.label}
+            className="rounded-2xl bg-card px-3 py-3 text-center shadow-[var(--shadow-soft)]"
+          >
+            <div className={`text-xl font-bold tabular-nums leading-none ${s.tone}`}>
+              {roster ? s.value : "—"}
+            </div>
+            <div className="mt-1 text-[10px] text-muted-foreground">{s.label}</div>
+          </div>
+        ))}
+      </div>
+
+      <RosterCard
+        count={roster?.length ?? null}
+        onSave={onSave}
+        onSaved={load}
+        busy={busy}
+      />
+
+      <div className="rounded-2xl bg-card p-4 shadow-[var(--shadow-soft)]">
+        <div className="mb-3 text-sm font-semibold">รายชื่อในระบบ</div>
+
+        <input
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="ค้นหา รหัส หรือ ชื่อ"
+          className="w-full rounded-xl bg-muted px-3 py-2.5 text-sm outline-none placeholder:text-muted-foreground/70 focus:ring-2 focus:ring-primary/40"
+        />
+
+        <div className="mt-2 grid grid-cols-3 gap-1 rounded-xl bg-muted p-1">
+          {[
+            { k: "all", label: "ทั้งหมด" },
+            { k: "reg", label: "ลงแล้ว" },
+            { k: "unreg", label: "ยังไม่ลง" },
+          ].map((f) => (
+            <button
+              key={f.k}
+              onClick={() => setFilter(f.k as typeof filter)}
+              className={`rounded-lg py-1.5 text-[11px] font-semibold transition-colors ${
+                filter === f.k
+                  ? "bg-card text-foreground shadow-[var(--shadow-soft)]"
+                  : "text-muted-foreground"
+              }`}
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
+
+        {err && <div className="py-8 text-center text-sm text-destructive">⚠️ {err}</div>}
+        {!err && !roster && (
+          <div className="py-8 text-center text-sm text-muted-foreground">กำลังโหลด…</div>
+        )}
+        {!err && roster && rows.length === 0 && (
+          <div className="py-8 text-center text-sm text-muted-foreground">
+            {total === 0 ? "ยังไม่มีรายชื่อรุ่นในระบบ" : "ไม่พบรายชื่อที่ค้นหา"}
+          </div>
+        )}
+        {!err && roster && rows.length > 0 && (
+          <>
+            <div className="mt-3 max-h-[58vh] overflow-y-auto rounded-xl border border-border/60">
+              <table className="w-full text-left">
+                <thead className="sticky top-0 z-10 bg-muted/95 text-[10px] font-semibold text-muted-foreground backdrop-blur">
+                  <tr>
+                    <th className="w-9 px-3 py-2">#</th>
+                    <th className="px-1 py-2">รหัส / ชื่อ</th>
+                    <th className="px-3 py-2 text-right">สถานะ</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r, i) => {
+                    const reg = registered.has(r.code);
+                    return (
+                      <tr
+                        key={r.code}
+                        className="border-t border-border/50 align-top odd:bg-muted/25"
+                      >
+                        <td className="px-3 py-2.5 text-[11px] tabular-nums text-muted-foreground">
+                          {i + 1}
+                        </td>
+                        <td className="px-1 py-2.5">
+                          <div className="text-[13px] font-medium leading-snug">{r.name}</div>
+                          <div className="mt-0.5 font-mono text-[11px] tabular-nums text-muted-foreground">
+                            {r.code}
+                          </div>
+                        </td>
+                        <td className="px-3 py-2.5 text-right">
+                          <span
+                            className={`inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-1 text-[10px] font-bold ${
+                              reg
+                                ? "bg-primary/15 text-primary"
+                                : "bg-foreground/5 text-muted-foreground"
+                            }`}
+                          >
+                            <span
+                              className={`h-1.5 w-1.5 rounded-full ${
+                                reg ? "bg-primary" : "bg-muted-foreground/50"
+                              }`}
+                            />
+                            {reg ? "ลงแล้ว" : "ยังไม่ลง"}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <p className="mt-2 text-center text-[11px] text-muted-foreground">
+              แสดง {rows.length} จาก {total} รายชื่อ
+            </p>
+          </>
+        )}
+      </div>
+
+      <div className="flex justify-center pt-2">
+        <ScopedResetButton
+          label="ล้างรายชื่อรุ่น (roster)"
+          title="ล้างรายชื่อรุ่น?"
+          message="รายชื่อรุ่นที่นำเข้าทั้งหมดจะถูกลบ ผู้ลงทะเบียนยังอยู่ในระบบแต่จะขึ้น “นอกรายชื่อ” ทั้งหมด กู้คืนไม่ได้"
+          confirmLabel="ล้างรายชื่อรุ่น"
+          busy={busy}
+          onConfirm={async () => {
+            await onReset();
+            await load();
+          }}
+        />
+      </div>
     </div>
   );
 }
@@ -1629,6 +2044,7 @@ function AdminView({
   onSaveSettings,
   onSetRegistrationOpen,
   onSaveRoster,
+  notify,
 }: {
   state: State;
   busy: boolean;
@@ -1637,13 +2053,13 @@ function AdminView({
   onSaveWards: (wards: Ward[]) => Promise<unknown>;
   onDeleteParticipant: (code: string) => Promise<unknown>;
   onRun: () => Promise<unknown>;
-  onReset: () => Promise<unknown>;
+  onReset: (scope: "participants" | "runs" | "wards" | "roster") => Promise<unknown>;
   onSaveSettings: (term: string, year: string, title: string) => Promise<unknown>;
   onSetRegistrationOpen: (open: boolean) => Promise<unknown>;
   onSaveRoster: (roster: RosterEntry[]) => Promise<unknown>;
+  notify: (msg: string, type?: "ok" | "err") => void;
 }) {
-  const [tab, setTab] = useState<"wards" | "list" | "results" | "history">("results");
-  const [showReset, setShowReset] = useState(false);
+  const [tab, setTab] = useState<"wards" | "list" | "roster" | "results" | "history">("results");
 
   return (
     <div className="fixed inset-0 z-50 overflow-y-auto bg-background px-4 pb-16 pt-6">
@@ -1660,10 +2076,12 @@ function AdminView({
           </button>
         </div>
         <LayoutGroup id="admin-tabs">
-          <nav className="mb-4 grid grid-cols-4 gap-1 rounded-2xl bg-card p-1 shadow-[var(--shadow-soft)]">
+          {/* 5 tabs กว้างเกิน max-w-md → scroll แนวนอน (ปุ่มกว้างตามข้อความ ไม่ต้องย่อตัวอักษร) */}
+          <nav className="mb-4 flex gap-1 overflow-x-auto rounded-2xl bg-card p-1 shadow-[var(--shadow-soft)] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
             {[
               { k: "results", label: "จัดสรร / ผล" },
-              { k: "list", label: `รายชื่อ (${state.participants.length})` },
+              { k: "list", label: `ผู้ลงทะเบียน (${state.participants.length})` },
+              { k: "roster", label: "รายชื่อ" },
               { k: "wards", label: `วอร์ด (${state.wards.length})` },
               { k: "history", label: "ประวัติ" },
             ].map((t) => {
@@ -1671,8 +2089,16 @@ function AdminView({
               return (
                 <button
                   key={t.k}
-                  onClick={() => setTab(t.k as typeof tab)}
-                  className={`relative rounded-xl px-1 py-2 text-[11px] font-semibold ${
+                  onClick={(e) => {
+                    setTab(t.k as typeof tab);
+                    // เลื่อน tab ที่กดเข้ามากลางจอ (บนมือถือ tab ท้ายๆ อยู่นอกจอ)
+                    e.currentTarget.scrollIntoView({
+                      behavior: "smooth",
+                      inline: "center",
+                      block: "nearest",
+                    });
+                  }}
+                  className={`relative shrink-0 whitespace-nowrap rounded-xl px-3.5 py-2 text-xs font-semibold ${
                     active ? "text-primary-foreground" : "text-muted-foreground"
                   }`}
                 >
@@ -1701,8 +2127,23 @@ function AdminView({
             {tab === "wards" && (
               <div className="space-y-3">
                 <SettingsCard settings={state.settings} onSave={onSaveSettings} busy={busy} />
-                <RosterCard adminKey={adminKey} onSave={onSaveRoster} busy={busy} />
-                <WardsAdmin wards={state.wards} onSave={onSaveWards} busy={busy} />
+                <WardsAdmin
+                  wards={state.wards}
+                  onSave={onSaveWards}
+                  busy={busy}
+                  adminKey={adminKey}
+                  notify={notify}
+                />
+                <div className="flex flex-col items-center gap-3 pt-2">
+                  <ScopedResetButton
+                    label="รีเซ็ตวอร์ดเป็นค่าเริ่มต้น"
+                    title="รีเซ็ตวอร์ดเป็นค่าเริ่มต้น?"
+                    message="วอร์ดทั้งหมดจะกลับเป็นค่าเริ่มต้น การจัดอันดับของผู้ใช้จะถูกล้าง ผลจัดสรรที่อ้างวอร์ดเดิมจะเหลือไม่มีวอร์ด กู้คืนไม่ได้"
+                    confirmLabel="รีเซ็ตวอร์ด"
+                    busy={busy}
+                    onConfirm={() => onReset("wards")}
+                  />
+                </div>
               </div>
             )}
             {tab === "list" && (
@@ -1715,6 +2156,16 @@ function AdminView({
                   isAdmin
                   onDeleteParticipant={onDeleteParticipant}
                 />
+                <div className="flex justify-center pt-2">
+                  <ScopedResetButton
+                    label="ลบผู้ลงทะเบียนทั้งหมด"
+                    title="ลบผู้ลงทะเบียนทั้งหมด?"
+                    message="รายชื่อผู้ลงทะเบียน การจัดอันดับ และผลการจัดสรรที่ผูกอยู่จะถูกลบทั้งหมด กู้คืนไม่ได้"
+                    confirmLabel="ลบทั้งหมด"
+                    busy={busy}
+                    onConfirm={() => onReset("participants")}
+                  />
+                </div>
               </div>
             )}
             {tab === "results" && (
@@ -1725,35 +2176,73 @@ function AdminView({
                   busy={busy}
                 />
                 <ResultsPanel state={state} onRun={onRun} busy={busy} />
+                <div className="flex justify-center pt-2">
+                  <ScopedResetButton
+                    label="ล้างผลการจัดสรรทั้งหมด"
+                    title="ล้างผลการจัดสรร?"
+                    message="ผลการจัดสรรและประวัติการสุ่มทั้งหมดจะถูกลบ รายชื่อผู้ลงทะเบียนและอันดับของแต่ละคนยังอยู่ กู้คืนไม่ได้"
+                    confirmLabel="ล้างผล"
+                    busy={busy}
+                    onConfirm={() => onReset("runs")}
+                  />
+                </div>
               </div>
+            )}
+            {tab === "roster" && (
+              <RosterPanel
+                adminKey={adminKey}
+                participants={state.participants}
+                onSave={onSaveRoster}
+                onReset={() => onReset("roster")}
+                busy={busy}
+              />
             )}
             {tab === "history" && <RunsHistory adminKey={adminKey} />}
           </motion.div>
         </AnimatePresence>
-
-        <div className="mt-8 text-center">
-          <button
-            onClick={() => setShowReset(true)}
-            className="text-xs text-muted-foreground underline underline-offset-4 hover:text-destructive"
-          >
-            ล้างข้อมูลทั้งหมด
-          </button>
-        </div>
       </div>
+    </div>
+  );
+}
 
-      {showReset && (
+// ปุ่ม link ขนาดเล็ก + ConfirmModal ของตัวเอง (จัด state open/close เอง)
+function ScopedResetButton({
+  label,
+  title,
+  message,
+  confirmLabel,
+  busy,
+  onConfirm,
+}: {
+  label: string;
+  title: string;
+  message: string;
+  confirmLabel: string;
+  busy: boolean;
+  onConfirm: () => Promise<unknown>;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button
+        onClick={() => setOpen(true)}
+        className="text-xs text-muted-foreground underline underline-offset-4 hover:text-destructive"
+      >
+        {label}
+      </button>
+      {open && (
         <ConfirmModal
-          title="ล้างข้อมูลทั้งหมด?"
-          message="ระบบจะลบรายชื่อผู้ลงทะเบียน การจัดอันดับ และผลการจัดสรรทั้งหมด การลบนี้กู้คืนไม่ได้"
-          confirmLabel="ล้างข้อมูล"
+          title={title}
+          message={message}
+          confirmLabel={confirmLabel}
           busy={busy}
           onConfirm={async () => {
-            await onReset();
-            setShowReset(false);
+            await onConfirm();
+            setOpen(false);
           }}
-          onClose={() => setShowReset(false)}
+          onClose={() => setOpen(false)}
         />
       )}
-    </div>
+    </>
   );
 }

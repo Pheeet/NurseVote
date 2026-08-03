@@ -94,3 +94,13 @@ INSERT INTO wards (id, name, capacity, pos) VALUES
   ('w5','วอร์ด 5',5,5),
   ('w6','วอร์ด 6',5,6)
 ON CONFLICT (id) DO NOTHING;
+
+-- เทมเพลตวอร์ด: admin เซฟชุดวอร์ดตั้งชื่อ แล้วโหลดกลับมาเติมใน editor ได้ (ใช้ข้ามเทอม)
+-- wards = snapshot {id,name,capacity}[] (ไม่เก็บ pos — ลำดับตาม array)
+-- resetAll() ไม่ลบตารางนี้ เพราะเทมเพลตเป็นของ admin ใช้ซ้ำได้ทุกเทอม
+CREATE TABLE IF NOT EXISTS ward_templates (
+  id         text PRIMARY KEY,                 -- uid จาก client (alphanumeric)
+  name       text NOT NULL,                    -- "เทอม 1/67"
+  wards      jsonb NOT NULL,                   -- [{id,name,capacity}, ...]
+  created_at timestamptz NOT NULL DEFAULT now()
+);

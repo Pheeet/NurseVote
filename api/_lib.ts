@@ -4,6 +4,8 @@ import { createHash } from "node:crypto";
 import { jwtVerify, createRemoteJWKSet } from "jose";
 
 export type Ward = { id: string; name: string; capacity: number; pos?: number };
+// เทมเพลต = snapshot ชุดวอร์ดตั้งชื่อ (wards ไม่มี pos — ลำดับตาม array)
+export type WardTemplate = { id: string; name: string; wards: Ward[] };
 // offRoster/email เติมเฉพาะ payload admin (public state ถูก mask, ไม่มี PII)
 export type Participant = {
   code: string;
@@ -43,6 +45,8 @@ const MAX_WARDS = 100;
 const WARD_NAME_MAX = 100;
 const WARD_ID_RE = /^[a-z0-9]{1,40}$/;
 const MAX_CAPACITY = 1000;
+const MAX_TEMPLATES = 50;
+const TEMPLATE_NAME_MAX = 100;
 const SETTING_MAX = 8;
 const TITLE_MAX = 200;
 export const MAX_BODY_BYTES = 64 * 1024;
@@ -96,6 +100,15 @@ export function validateWards(raw: unknown): Ward[] {
     }
     return { id, name, capacity };
   });
+}
+
+// validate + normalize เทมเพลตจาก client (id required, name, wards ผ่าน validateWards)
+export function validateTemplate(raw: unknown): WardTemplate {
+  const id = String((raw as any)?.id ?? "");
+  if (!WARD_ID_RE.test(id)) bad("invalid template id");
+  const name = String((raw as any)?.name ?? "").trim().slice(0, TEMPLATE_NAME_MAX);
+  if (!name) bad("template name required");
+  return { id, name, wards: validateWards((raw as any)?.wards) };
 }
 
 // validate term/year/title (คืน trimmed + cap ความยาว) — โยน 400 ถ้าว่าง
@@ -506,6 +519,46 @@ export async function replaceWards(wards: Ward[]) {
   await sql`DELETE FROM choices`;
 }
 
+/* ============ Ward Templates (preset ชุดวอร์ดของ admin) ============ */
+
+// list เทมเพลตทั้งหมด (เรียงใหม่สุดก่อน)
+export async function listWardTemplates(): Promise<WardTemplate[]> {
+  const sql = db();
+  const rows = (await sql`SELECT id, name, wards FROM ward_templates ORDER BY created_at DESC`) as Row[];
+  return rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    // wards เก็บเป็น jsonb → neon คืนเป็น array อยู่แล้ว; normalize ปลอดภัยหน่อย
+    wards: parseJson<any[]>(r.wards, []).map((w: any) => ({
+      id: String(w.id),
+      name: String(w.name),
+      capacity: Number(w.capacity),
+    })),
+  }));
+}
+
+// upsert เทมเพลต (id ซ้ำ = update); insert ใหม่ต้องไม่เกิน MAX_TEMPLATES
+export async function saveWardTemplate(t: WardTemplate) {
+  const sql = db();
+  const existing = (await sql`SELECT 1 FROM ward_templates WHERE id = ${t.id}`) as Row[];
+  if (!existing.length) {
+    const n = ((await sql`SELECT count(*)::int AS c FROM ward_templates`) as Row[])[0]?.c ?? 0;
+    if (n >= MAX_TEMPLATES) bad("too many templates");
+  }
+  // strip pos ออกจาก wards ตอนเก็บ (ลำดับดูจาก array)
+  const wards = t.wards.map(({ id, name, capacity }) => ({ id, name, capacity }));
+  await sql`
+    INSERT INTO ward_templates (id, name, wards)
+    VALUES (${t.id}, ${t.name}, ${JSON.stringify(wards)}::jsonb)
+    ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, wards = EXCLUDED.wards
+  `;
+}
+
+export async function deleteWardTemplate(id: string) {
+  const sql = db();
+  await sql`DELETE FROM ward_templates WHERE id = ${id}`;
+}
+
 export async function runAdmission(): Promise<{ assignments: Assignment[]; runAt: string }> {
   const sql = db();
   const [wards, participants, choices] = (await Promise.all([
@@ -621,14 +674,47 @@ export async function getRunsHistory(): Promise<RunSummary[]> {
 
 export async function resetAll() {
   const sql = db();
-  await sql`DELETE FROM assignments`;
-  await sql`DELETE FROM runs`;
-  await sql`DELETE FROM choices`;
-  await sql`DELETE FROM participants`;
-  await sql`DELETE FROM wards`;
-  for (let i = 0; i < DEFAULT_WARDS.length; i++) {
-    const w = DEFAULT_WARDS[i];
-    await sql`INSERT INTO wards (id, name, capacity, pos) VALUES (${w.id}, ${w.name}, ${w.capacity}, ${i})`;
+  // atomic: ลบ + seed ทั้งหมดใน transaction เดียว ถ้าสัก statement fail → rollback ไม่เหลือ state ครึ่งๆ กลางๆ
+  await sql.transaction([
+    sql`DELETE FROM assignments`,
+    sql`DELETE FROM runs`,
+    sql`DELETE FROM choices`,
+    sql`DELETE FROM participants`,
+    sql`DELETE FROM wards`,
+    ...DEFAULT_WARDS.map((w, i) =>
+      sql`INSERT INTO wards (id, name, capacity, pos) VALUES (${w.id}, ${w.name}, ${w.capacity}, ${i})`,
+    ),
+  ]);
+}
+
+// reset แบบแยกขอบเขต ตาม tab ของ admin. cascade ฝั่ง DB (FK ON DELETE) จัดการตารางที่ขึ้นต่อกัน:
+//   participants → choices + assignments หาย / runs → assignments หาย / wards → choices หาย + assignments.ward_id NULL
+export async function resetScope(scope: string) {
+  const sql = db();
+  switch (scope) {
+    case "all":
+      return resetAll();
+    // ลบผู้ลงทะเบียนทั้งหมด → choices + assignments cascade ไปด้วย. runs ยังอยู่แต่ว่าง
+    case "participants":
+      return sql`DELETE FROM participants`;
+    // ล้างผล + ประวัติการจัดสรร → assignments cascade ไปด้วย. เก็บ participants + choices ไว้
+    case "runs":
+      return sql`DELETE FROM runs`;
+    // ล้างรายชื่อรุ่น (soft roster, ไม่ผูกอะไร) — participants ที่ขึ้น "นอกรายชื่อ" จะกลับเป็น off-roster ทั้งหมด
+    case "roster":
+      return sql`DELETE FROM roster`;
+    // รีเซ็ตวอร์ดเป็น default w1–w6 → choices cascade, assignments.ward_id NULL
+    case "wards": {
+      await sql.transaction([
+        sql`DELETE FROM wards`,
+        ...DEFAULT_WARDS.map((w, i) =>
+          sql`INSERT INTO wards (id, name, capacity, pos) VALUES (${w.id}, ${w.name}, ${w.capacity}, ${i})`,
+        ),
+      ]);
+      return;
+    }
+    default:
+      throw new Error("invalid reset scope");
   }
 }
 
