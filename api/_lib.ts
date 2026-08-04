@@ -1,6 +1,6 @@
 import { neon } from "@neondatabase/serverless";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { createHash } from "node:crypto";
+import { createHash, randomInt } from "node:crypto";
 import { jwtVerify, createRemoteJWKSet } from "jose";
 
 export type Ward = { id: string; name: string; capacity: number; pos?: number };
@@ -234,10 +234,11 @@ export function db() {
   return neon(process.env.DATABASE_URL);
 }
 
+// Fisher-Yates ด้วย CSPRNG — ผลจัดสรรเป็นล็อตเตอรี่จริง ไม่มีใครทำนาย/ล็อกลำดับล่วงหน้าได้
 function shuffle<T>(arr: T[]): T[] {
   const a = [...arr];
   for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = randomInt(i + 1);
     [a[i], a[j]] = [a[j], a[i]];
   }
   return a;
@@ -263,7 +264,8 @@ export async function getState(opts: { admin: boolean } = { admin: false }): Pro
       (SELECT coalesce(json_agg(json_build_object('participant_code',participant_code,'ward_id',ward_id,'rank',rank) ORDER BY participant_code, rank), '[]'::json)
          FROM choices) AS choices,
       (SELECT row_to_json(r) FROM (SELECT id, created_at FROM runs ORDER BY id DESC LIMIT 1) r) AS latest_run,
-      (SELECT coalesce(json_agg(json_build_object('participant_code',participant_code,'ward_id',ward_id,'rank',rank)), '[]'::json)
+      (SELECT coalesce(json_agg(json_build_object('participant_code',participant_code,'ward_id',ward_id,'rank',rank)
+                ORDER BY rank NULLS LAST, participant_code), '[]'::json)
          FROM assignments WHERE run_id = (SELECT max(id) FROM runs)) AS assignments,
       (SELECT coalesce(json_object_agg(key, value), '{}'::json) FROM settings) AS settings
   `) as Row[];
