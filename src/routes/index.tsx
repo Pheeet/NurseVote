@@ -911,24 +911,110 @@ function ListPanel({
 
 /* ============ WARDS ============ */
 
-function WardsReadonly({ wards, participants }: { wards: Ward[]; participants: Participant[] }) {
+// showDemand: ตัวเลข/ลำดับที่สะท้อนความฮิตของวอร์ด — admin เท่านั้น
+// นักศึกษาเห็นแล้วจะย้ายอันดับตามวอร์ดที่คนลงน้อย (เล่นเกม) และวอร์ดฮิตที่ลอยขึ้นบนก็ดูดคนเพิ่ม (herd)
+// Choice ต้องเป็นความต้องการจริงของแต่ละคน ไม่ใช่ผลตอบสนองต่อยอดรวม
+function WardsReadonly({
+  wards,
+  participants,
+  showDemand = false,
+}: {
+  wards: Ward[];
+  participants: Participant[];
+  showDemand?: boolean;
+}) {
   const total = wards.reduce((s, w) => s + w.capacity, 0);
+  const N = wards.length;
+
+  // ทุกคนต้องจัดอันดับครบทุกวอร์ด → ยอดรวมทุกอันดับของทุกวอร์ดเท่ากันหมด (= จำนวนผู้ลงทะเบียน)
+  // ตัวเลขที่มีความหมายคือแยกตามอันดับ: demand[wardId][rank-1] = จำนวนคนที่เลือกวอร์ดนั้นเป็นอันดับนั้น
+  const demand = useMemo(() => {
+    const m = new Map(wards.map((w) => [w.id, Array(N).fill(0) as number[]]));
+    for (const p of participants)
+      p.choices.forEach((wid, i) => {
+        const a = m.get(wid);
+        if (a && i < N) a[i]++;
+      });
+    return m;
+  }, [wards, participants, N]);
+
+  // เลขวงกลม = ลำดับเดิมของวอร์ด (wards มาจาก getState เรียงตาม pos แล้ว)
+  // ไม่ใช้ w.pos ตรงๆ เพราะเป็น optional และ seed default เขียนแบบ 0-based
+  const posNo = useMemo(() => new Map(wards.map((w, i) => [w.id, i + 1])), [wards]);
+
+  // admin: เรียงตามจำนวนคนที่เลือกเป็นอันดับ 1 มาก→น้อย เสมอกันตัดด้วยลำดับเดิม (deterministic)
+  // นักศึกษา: เรียงตาม pos เท่านั้น — ถ้าเรียงตามความฮิต ตัวเลขที่ซ่อนไว้ก็รั่วออกทางลำดับอยู่ดี
+  const sorted = useMemo(
+    () =>
+      showDemand
+        ? wards
+            .map((w, i) => ({ w, i }))
+            .sort(
+              (a, b) =>
+                (demand.get(b.w.id)?.[0] ?? 0) - (demand.get(a.w.id)?.[0] ?? 0) || a.i - b.i,
+            )
+            .map(({ w }) => w)
+        : wards,
+    [wards, demand, showDemand],
+  );
+
   return (
     <div className="space-y-3">
       <div className="rounded-2xl bg-accent/30 p-3 text-center text-xs text-accent-foreground">
         รับได้รวม <b>{total}</b> คน · ลงทะเบียนแล้ว <b>{participants.length}</b> คน
       </div>
-      {wards.map((w, i) => (
-        <div key={w.id} className="flex items-center gap-3 rounded-2xl bg-card p-3 shadow-[var(--shadow-soft)]">
-          <div className="flex h-9 w-9 items-center justify-center rounded-full bg-primary/15 text-sm font-bold text-primary">
-            {i + 1}
-          </div>
-          <div className="flex-1 text-sm font-semibold">{w.name}</div>
-          <div className="rounded-lg bg-muted px-2 py-1 text-xs text-muted-foreground">
-            รับ <b className="text-foreground">{w.capacity}</b> คน
-          </div>
-        </div>
-      ))}
+      {sorted.map((w) => {
+        const counts = demand.get(w.id) ?? [];
+        return (
+          <motion.div
+            key={w.id}
+            layout
+            transition={{ type: "spring", stiffness: 400, damping: 40 }}
+            className="rounded-2xl bg-card p-3 shadow-[var(--shadow-soft)]"
+          >
+            <div className="flex items-center gap-3">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary/15 text-sm font-bold text-primary">
+                {posNo.get(w.id)}
+              </div>
+              <div className="min-w-0 flex-1 text-sm font-semibold">{w.name}</div>
+              <div className="shrink-0 rounded-lg bg-muted px-2 py-1 text-xs text-muted-foreground">
+                รับ <b className="text-foreground">{w.capacity}</b> คน
+              </div>
+            </div>
+
+            {showDemand && (
+              <>
+                {/* แถบสัดส่วนอันดับ: อันดับ 1 ทึบสุด → อันดับท้ายจางสุด (ไม่เพิ่ม palette ใหม่) */}
+                <div className="mt-2.5 flex h-2 overflow-hidden rounded-full bg-muted">
+                  {counts.map((c, i) =>
+                    c > 0 && participants.length > 0 ? (
+                      <div
+                        key={i}
+                        className="bg-primary"
+                        style={{
+                          width: `${(c / participants.length) * 100}%`,
+                          opacity: 1 - (i / Math.max(1, N - 1)) * 0.8,
+                        }}
+                      />
+                    ) : null,
+                  )}
+                </div>
+
+                <div className="mt-2 flex flex-wrap gap-1">
+                  {counts.map((c, i) => (
+                    <span
+                      key={i}
+                      className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] tabular-nums text-muted-foreground"
+                    >
+                      อันดับ {i + 1} <b className="text-foreground">{c}</b>
+                    </span>
+                  ))}
+                </div>
+              </>
+            )}
+          </motion.div>
+        );
+      })}
     </div>
   );
 }
@@ -2134,6 +2220,7 @@ function AdminView({
                   adminKey={adminKey}
                   notify={notify}
                 />
+                <WardsReadonly wards={state.wards} participants={state.participants} showDemand />
                 <div className="flex flex-col items-center gap-3 pt-2">
                   <ScopedResetButton
                     label="รีเซ็ตวอร์ดเป็นค่าเริ่มต้น"
