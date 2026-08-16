@@ -1625,10 +1625,61 @@ function fmtDateTH(iso: string) {
   }
 }
 
-function RunsHistory({ adminKey }: { adminKey: string }) {
+// วัน-เดือน-ปี พ.ศ. + เวลา 4 หลัก จาก timestamp ของ run (เวลาเครื่อง admin = ไทย)
+// ไม่ใช้ toLocaleString เพราะต้องการรูปแบบตายตัวสำหรับชื่อไฟล์
+function runStamp(iso: string) {
+  const d = new Date(iso);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return {
+    date: `${p(d.getDate())}-${p(d.getMonth() + 1)}-${d.getFullYear() + 543}`,
+    time: `${p(d.getHours())}${p(d.getMinutes())}`,
+  };
+}
+
+// ผลของ run หนึ่ง → .xlsx sheet เดียว เรียงตามวอร์ด (pos) → รหัส, คนไม่ได้วอร์ดต่อท้าย
+// ไม่มี metadata บนหัวตาราง (พัง AutoFilter/Ctrl+T) — ที่มาอยู่ในชื่อไฟล์กับชื่อ sheet แทน
+async function exportRunXlsx(run: RunSummary, wards: Ward[]) {
+  const { default: writeExcelFile } = await import("write-excel-file/browser");
+
+  const posOf = new Map(wards.map((w, i) => [w.id, i]));
+  // วอร์ดที่ถูกลบไปแล้วไม่มี pos → ต่อท้ายวอร์ดที่รู้จัก แต่ยังมาก่อนกลุ่มไม่ได้วอร์ด
+  const groupOf = (it: RunItem) => (it.wardId ? (posOf.get(it.wardId) ?? 1e6) : 1e9);
+  const rows = [...run.items].sort(
+    (a, b) => groupOf(a) - groupOf(b) || a.code.localeCompare(b.code),
+  );
+
+  const H = (value: string) => ({ value, fontWeight: "bold" as const });
+  const stamp = runStamp(run.runAt);
+
+  await writeExcelFile(rows, {
+    columns: [
+      { header: H("ลำดับ"), width: 6, cell: (_: RunItem, i: number) => ({ value: i + 1, type: Number }) },
+      // type: String บังคับไว้ ไม่งั้น Excel กินรหัสเป็นตัวเลข → 0 นำหน้าหาย
+      { header: H("รหัสนักศึกษา"), width: 14, cell: (it: RunItem) => ({ value: it.code, type: String }) },
+      { header: H("ชื่อ"), width: 24, cell: (it: RunItem) => ({ value: it.name, type: String }) },
+      {
+        header: H("วอร์ดที่ได้"),
+        width: 14,
+        cell: (it: RunItem) => ({ value: it.wardId ? it.wardName : "ไม่ได้วอร์ด", type: String }),
+      },
+      // คนไม่ได้วอร์ด = ช่องว่าง ไม่ใช่ "—" เพื่อให้ทั้งคอลัมน์เป็น Number แล้ว sort ตามเลขได้
+      {
+        header: H("ได้อันดับที่"),
+        width: 11,
+        cell: (it: RunItem) => (it.rank == null ? {} : { value: it.rank, type: Number }),
+      },
+    ],
+    sheet: `รอบ ${run.id} • ${stamp.date}`,
+    stickyRowsCount: 1,
+  }).toFile(`ผลจัดสรรวอร์ด_${stamp.date}_${stamp.time}.xlsx`);
+}
+
+function RunsHistory({ adminKey, wards }: { adminKey: string; wards: Ward[] }) {
   const [runs, setRuns] = useState<RunSummary[] | null>(null);
   const [err, setErr] = useState("");
   const [openId, setOpenId] = useState<number | null>(null);
+  const [exporting, setExporting] = useState<number | null>(null);
+  const [exportErr, setExportErr] = useState("");
 
   const load = async () => {
     try {
@@ -1666,6 +1717,11 @@ function RunsHistory({ adminKey }: { adminKey: string }) {
 
   return (
     <div className="space-y-2">
+      {exportErr && (
+        <div className="rounded-xl bg-destructive/10 p-2 text-center text-xs text-destructive">
+          ⚠️ {exportErr}
+        </div>
+      )}
       {runs.map((run, idx) => {
         const open = openId === run.id;
         const latest = idx === 0;
@@ -1681,9 +1737,11 @@ function RunsHistory({ adminKey }: { adminKey: string }) {
         }
         return (
           <div key={run.id} className="rounded-2xl bg-card p-3 shadow-[var(--shadow-soft)]">
+            {/* ปุ่ม export เป็นพี่น้องกับปุ่มกาง ไม่ใช่ลูก — nested button ผิด HTML และคลิกจะทะลุไปกางการ์ด */}
+            <div className="flex items-center gap-2">
             <button
               onClick={() => setOpenId(open ? null : run.id)}
-              className="flex w-full items-center justify-between gap-2 text-left"
+              className="flex min-w-0 flex-1 items-center justify-between gap-2 text-left"
             >
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
@@ -1711,6 +1769,25 @@ function RunsHistory({ adminKey }: { adminKey: string }) {
                 <span className="ml-1 text-muted-foreground">{open ? "▲" : "▼"}</span>
               </div>
             </button>
+            <button
+              onClick={async () => {
+                setExporting(run.id);
+                try {
+                  await exportRunXlsx(run, wards);
+                } catch (e: any) {
+                  // แยกจาก err ของการโหลด — err ทำให้ทั้ง panel กลายเป็นหน้า error รายการ run หายหมด
+                  setExportErr(e?.message || "สร้างไฟล์ Excel ไม่ได้");
+                } finally {
+                  setExporting(null);
+                }
+              }}
+              disabled={exporting !== null}
+              title="ดาวน์โหลดเป็น Excel"
+              className="shrink-0 rounded-lg bg-muted px-2 py-1.5 text-[10px] font-semibold text-muted-foreground transition active:scale-95 disabled:opacity-40"
+            >
+              {exporting === run.id ? "…" : "⬇ Excel"}
+            </button>
+            </div>
 
             <AnimatePresence initial={false}>
               {open && (
@@ -2284,7 +2361,7 @@ function AdminView({
                 busy={busy}
               />
             )}
-            {tab === "history" && <RunsHistory adminKey={adminKey} />}
+            {tab === "history" && <RunsHistory adminKey={adminKey} wards={state.wards} />}
           </motion.div>
         </AnimatePresence>
       </div>
