@@ -264,8 +264,10 @@ export async function getState(opts: { admin: boolean } = { admin: false }): Pro
       (SELECT coalesce(json_agg(json_build_object('participant_code',participant_code,'ward_id',ward_id,'rank',rank) ORDER BY participant_code, rank), '[]'::json)
          FROM choices) AS choices,
       (SELECT row_to_json(r) FROM (SELECT id, created_at FROM runs ORDER BY id DESC LIMIT 1) r) AS latest_run,
+      -- เรียงตามรหัสล้วน เหมือนกันทั้ง getState, getRunsHistory และไฟล์ Excel ที่ export
+      -- ไม่เอา rank มานำ: จะทำให้การ์ดวอร์ดกลายเป็นผังว่าใครอยากอยู่วอร์ดนี้มากสุด ทั้งที่ rank โชว์เป็น badge อยู่แล้ว
       (SELECT coalesce(json_agg(json_build_object('participant_code',participant_code,'ward_id',ward_id,'rank',rank)
-                ORDER BY rank NULLS LAST, participant_code), '[]'::json)
+                ORDER BY participant_code), '[]'::json)
          FROM assignments WHERE run_id = (SELECT max(id) FROM runs)) AS assignments,
       (SELECT coalesce(json_object_agg(key, value), '{}'::json) FROM settings) AS settings
   `) as Row[];
@@ -632,7 +634,7 @@ export async function getRunsHistory(): Promise<RunSummary[]> {
     LEFT JOIN assignments a ON a.run_id = r.id
     LEFT JOIN participants p ON p.code = a.participant_code
     LEFT JOIN wards w ON w.id = a.ward_id
-    ORDER BY r.id DESC, a.rank NULLS LAST, p.name
+    ORDER BY r.id DESC, a.participant_code
   `) as (Row & {
     run_id: number;
     run_at: string;
